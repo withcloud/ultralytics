@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # Load the model from the first training
-model = YOLO("runs/pose/train41/weights/last.pt")  # 使用第一次訓練的最終權重
+model = YOLO("/root/autodl-tmp/ultralytics/runs/pose/train41/weights/last.pt")  # 使用第一次訓練的最終權重
 
 # Train the model with fine-tuning parameters
 results = model.train(
