@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # Load the model from the fifth training stage best weights
-model = YOLO("/root/autodl-tmp/ultralytics/runs/pose/train52/weights/best.pt")  # 使用第五次訓練的最佳權重
+model = YOLO("/root/autodl-tmp/ultralytics/runs/pose/train55/weights/last.pt")  # 使用第五次訓練的最佳權重
 
 # Train the model with focus on pose keypoint precision
 results = model.train(
@@ -33,5 +33,6 @@ results = model.train(
     degrees=0.0,         # 關閉旋轉增強
     translate=0.1,       # 減少平移增強
     scale=0.1,           # 減少縮放增強
-    fliplr=0.5           # 保留水平翻轉
+    fliplr=0.5,          # 保留水平翻轉
+    resume=True
 ) 
