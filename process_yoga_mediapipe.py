@@ -15,7 +15,7 @@ OUTPUT_DIR = "datasets/yoga82/labels_mediapipe/train"
 PRED_DIR = "datasets/yoga82/preds_mediapipe/train"
 CSV_OUTPUT = "datasets/yoga82/results_mediapipe.csv"
 
-TEST_MODE = True
+TEST_MODE = False
 
 # 新增人體置信度過濾閾值
 POSE_CONFIDENCE_THRESHOLD = 0.9  # 只處理平均置信度超過此值的檢測結果
