@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # 加載第七次訓練的最佳權重
-model = YOLO("/root/autodl-tmp/ultralytics/runs/pose/train/weights/best.pt")  # 使用第七次訓練的最佳權重
+model = YOLO(" /root/autodl-tmp/ultralytics/runs/pose/train49/weights/best.pt")  # 使用第七次訓練的最佳權重
 
 # 針對COCO評估標準的優化策略
 results = model.train(
