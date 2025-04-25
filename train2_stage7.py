@@ -1,42 +1,49 @@
 from ultralytics import YOLO
 
-# 加載第六次訓練的最佳權重
-model = YOLO("/root/autodl-tmp/ultralytics/runs/pose/train55/weights/best.pt")  # 使用第六次訓練的最佳權重
+# 加載第七次訓練的最佳權重
+model = YOLO("/root/autodl-tmp/ultralytics/runs/pose/train55/weights/best.pt")  # 使用最佳權重
 
-# 專注於提高pose mAP50-95的訓練策略
+# 最終微調策略：根據官方參數優化
 results = model.train(
     data="coco-pose.yaml",
-    epochs=50,            # 保持epochs數量
-    imgsz=1280,           # 降回到1280，與第六次訓練保持一致
-    batch=64,             # 減少批次大小以提高精度
-    save_period=1,        # 每個epoch保存
-    cache="disk",         # 使用磁盤緩存
-    optimizer="AdamW",    # 繼續使用AdamW優化器
-    lr0=0.000005,         # 使用更低的學習率進行精細微調
-    lrf=0.0005,           # 更小的最終學習率因子
-    cos_lr=True,          # 餘弦學習率調度
-    warmup_epochs=2.0,    # 適度的熱身期
-    device="0,1,2,3",     # 使用全部4個GPU
-    patience=40,          # 保持耐心值
-    box=12.0,             # 略微增加框損失權重
-    pose=35.0,            # 大幅增加姿態損失權重
-    kobj=10.0,            # 增加關鍵點對象損失權重
-    close_mosaic=0,       # 完全關閉馬賽克增強
-    amp=True,             # 啟用混合精度訓練
-    overlap_mask=True,    # 啟用重疊口罩
+    epochs=100,             # 延長訓練週期
+    imgsz=1280,             # 保持較高解析度
+    batch=32,               # 使用中等批次大小
+    save_period=1,          # 每個epoch保存
+    cache="disk",           # 使用磁盤緩存
+    optimizer="AdamW",      # 繼續使用AdamW優化器
+    lr0=0.00001,            # 非常低的學習率
+    lrf=0.01,               # 標準最終學習率因子
+    momentum=0.85,          # 降低動量值以精確優化
+    weight_decay=0.0001,    # 減少權重衰減以減少正則化
+    warmup_epochs=0.0,      # 關閉熱身
+    warmup_momentum=0.8,    # 設置熱身動量
+    warmup_bias_lr=0.01,    # 設置熱身偏置學習率
+    box=6.0,                # 降低框損失權重
+    pose=25.0,              # 提高姿態損失權重
+    kobj=7.0,               # 提高關鍵點對象損失權重
+    cls=0.2,                # 降低分類損失權重 
+    dfl=1.0,                # 降低分布焦點損失權重
+    nbs=64,                 # 標準標稱批次大小
+    cos_lr=True,            # 啟用餘弦學習率調度
+    close_mosaic=0,         # 完全關閉馬賽克增強
+    amp=True,               # 啟用混合精度訓練
+    device="0,1,2,3",       # 使用全部4個GPU
+    dropout=0.2,            # 添加dropout正則化
+    overlap_mask=True,      # 啟用重疊口罩
+    patience=50,            # 較長耐心值
+    val=True,               # 確保每個epoch驗證
+    freeze=15,              # 凍結前15層，專注於微調後層
     
-    # 數據增強參數 (最小化增強以專注於原始數據學習)
-    hsv_h=0.005,          # 最小色調變化 (0.0-1.0)
-    hsv_s=0.05,           # 最小飽和度變化 (0.0-1.0)
-    hsv_v=0.05,           # 最小亮度變化 (0.0-1.0)
-    degrees=0.0,          # 關閉旋轉增強 (0.0-180.0)
-    translate=0.02,       # 最小平移增強 (0.0-1.0)
-    scale=0.02,           # 最小縮放增強 (>=0.0)
-    shear=0.0,            # 關閉剪切增強 (-180.0-180.0)
-    perspective=0.0,      # 關閉透視變換 (0.0-0.001)
-    flipud=0.0,           # 關閉垂直翻轉 (0.0-1.0)
-    fliplr=0.5,           # 保留水平翻轉 (0.0-1.0)
-    mosaic=0.0,           # 關閉馬賽克增強 (0.0-1.0)
-    mixup=0.0,            # 關閉Mixup增強 (0.0-1.0)
-    copy_paste=0.0,       # 關閉複製粘貼增強 (0.0-1.0)
-) 
+    # 數據增強參數調整為更適合關鍵點精度的值
+    hsv_h=0.01,             # 最小色調變化
+    hsv_s=0.1,              # 減少飽和度變化
+    hsv_v=0.1,              # 減少亮度變化
+    degrees=0.0,            # 關閉旋轉
+    translate=0.05,         # 最小平移
+    scale=0.1,              # 最小縮放
+    fliplr=0.5,             # 保持水平翻轉
+    mosaic=0.0,             # 關閉馬賽克
+    mixup=0.0,              # 關閉mixup
+    copy_paste=0.0          # 關閉複製粘貼
+)
