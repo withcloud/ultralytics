@@ -24,19 +24,19 @@ results = model.train(
     close_mosaic=0,       # 完全關閉馬賽克增強
     amp=True,             # 啟用混合精度訓練
     overlap_mask=True,    # 啟用重疊口罩
-    multi_scale=False,    # 關閉多尺度訓練以專注於高解析度訓練
-    augment=True,         # 保持增強
-    hsv_h=0.01,           # 最小色調變化
-    hsv_s=0.1,            # 減少飽和度變化
-    hsv_v=0.1,            # 減少亮度變化
-    translate=0.05,       # 最小平移增強
-    scale=0.05,           # 最小縮放增強
-    fliplr=0.5,           # 保留水平翻轉
-    flipud=0.0,           # 禁用垂直翻轉
-    mosaic=0.0,           # 關閉馬賽克增強
-    mixup=0.0,            # 關閉mixup
-    copy_paste=0.0,       # 關閉複製粘貼
-    degrees=0.0,          # 關閉旋轉
-    perspective=0.0,      # 關閉透視變換
-    shear=0.0             # 關閉剪切
+    
+    # 數據增強參數 (根據官方文檔設置)
+    hsv_h=0.01,           # 色調變化 (0.0-1.0)
+    hsv_s=0.1,            # 飽和度變化 (0.0-1.0)
+    hsv_v=0.1,            # 亮度變化 (0.0-1.0)
+    degrees=0.0,          # 旋轉增強 (0.0-180.0)
+    translate=0.05,       # 平移增強 (0.0-1.0)
+    scale=0.05,           # 縮放增強 (>=0.0)
+    shear=0.0,            # 剪切增強 (-180.0-180.0)
+    perspective=0.0,      # 透視變換 (0.0-0.001)
+    flipud=0.0,           # 垂直翻轉概率 (0.0-1.0)
+    fliplr=0.5,           # 水平翻轉概率 (0.0-1.0)
+    mosaic=0.0,           # 馬賽克增強概率 (0.0-1.0)
+    mixup=0.0,            # Mixup增強概率 (0.0-1.0)
+    copy_paste=0.0        # 複製粘貼增強概率 (0.0-1.0)
 ) 
