@@ -7,6 +7,7 @@ import torch.distributed as dist
 import os
 
 from ultralytics.utils import LOGGER
+from ultralytics.utils.dev import describe_var
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -215,7 +216,7 @@ class v8PoseLoss(v8DetectionLoss):
             )
 
             if rank == 1:
-                raise Exception("test")
+                raise Exception(describe_var(teacher_preds))
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
