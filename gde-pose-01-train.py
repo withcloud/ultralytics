@@ -42,11 +42,11 @@ def main():
         distill=0.0,           # 較高蒸餾權重
         freezeAllBN=True,
 
-        box=0.0001, # (float) box loss gain
-        cls=0.0001, # (float) cls loss gain (scale with pixels)
-        dfl=0.0001, # (float) dfl loss gain
-        pose=0.0001, # (float) pose loss gain
-        kobj=0.0001, # (float) keypoint obj loss gain
+        box=0.00001, # (float) box loss gain
+        cls=0.00001, # (float) cls loss gain (scale with pixels)
+        dfl=0.00001, # (float) dfl loss gain
+        pose=0.00001, # (float) pose loss gain
+        kobj=0.00001, # (float) keypoint obj loss gain
         
         # 優化器設置
         optimizer="Adam",
