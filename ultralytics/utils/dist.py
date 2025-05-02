@@ -5,6 +5,9 @@ import shutil
 import socket
 import sys
 import tempfile
+import logging
+from pathlib import Path
+import torch.distributed as dist
 
 from . import USER_CONFIG_DIR
 from .torch_utils import TORCH_1_9
@@ -50,12 +53,37 @@ def generate_ddp_file(trainer):
 
     content = f"""
 # Ultralytics Multi-GPU training temp file (should be automatically deleted after use)
+import os
+import sys
+import logging
+from pathlib import Path
+import torch.distributed as dist
+
+# 設置所有 GPU 進程顯示日誌，無視 rank
 overrides = {vars(trainer.args)}
 
 if __name__ == "__main__":
     from {module} import {name}
     from ultralytics.utils import DEFAULT_CFG_DICT
-
+    
+    # 強制所有 GPU 進程顯示日誌
+    rank = int(os.environ.get("RANK", -1))
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    
+    # 設置所有進程顯示 INFO 級別日誌
+    logging_name = "ultralytics"
+    logger = logging.getLogger(logging_name)
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setLevel(logging.INFO)
+    
+    # 添加 rank 信息到各個進程的日誌前綴
+    gpu_id = local_rank if local_rank != -1 else 0
+    log_prefix = f"[Rank {{rank}}, GPU {{gpu_id}}] "
+    
+    # 輸出啟動信息
+    print(f"{{log_prefix}}DDP 進程啟動，RANK={{rank}}, LOCAL_RANK={{local_rank}}")
+    
     cfg = DEFAULT_CFG_DICT.copy()
     cfg.update(save_dir='')   # handle the extra key 'save_dir'
     trainer = {name}(cfg=cfg, overrides=overrides)

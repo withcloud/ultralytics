@@ -359,9 +359,8 @@ class BaseTrainer:
                 self._close_dataloader_mosaic()
                 self.train_loader.reset()
 
-            if RANK in {-1, 0}:
-                LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
+            LOGGER.info(self.progress_string())
+            pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
@@ -408,21 +407,20 @@ class BaseTrainer:
                             break
 
                 # Log
-                if RANK in {-1, 0}:
-                    loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
-                        )
+                loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                pbar.set_description(
+                    ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                    % (
+                        f"{epoch + 1}/{self.epochs}",
+                        f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                        *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                        batch["cls"].shape[0],  # batch size, i.e. 8
+                        batch["img"].shape[-1],  # imgsz, i.e 640
                     )
-                    self.run_callbacks("on_batch_end")
-                    if self.args.plots and ni in self.plot_idx:
-                        self.plot_training_samples(batch, ni)
+                )
+                self.run_callbacks("on_batch_end")
+                if self.args.plots and ni in self.plot_idx and RANK in {-1, 0}:  # 保留繪圖只在主進程
+                    self.plot_training_samples(batch, ni)
 
                 self.run_callbacks("on_train_batch_end")
 
