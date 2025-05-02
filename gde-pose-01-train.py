@@ -32,7 +32,7 @@ def main():
         data="coco-pose.yaml",
         epochs=100,             # 初步實驗用20個epoch
         imgsz=640,
-        batch=126,             # 4個4090的大批量
+        batch=144,
         device=[0, 1, 2, 3, 4, 5],
         workers=16,
         
@@ -45,7 +45,7 @@ def main():
         # box=0.00001, # (float) box loss gain
         # cls=0.00001, # (float) cls loss gain (scale with pixels)
         # dfl=0.00001, # (float) dfl loss gain
-        # pose=0.00001, # (float) pose loss gain
+        pose=15.0, # (float) pose loss gain
         # kobj=0.00001, # (float) keypoint obj loss gain
         
         # 優化器設置
@@ -56,7 +56,7 @@ def main():
         weight_decay=0.0005,  # 權重衰減
         
         # 訓練策略
-        warmup_epochs=3.0,    # 預熱epochs
+        warmup_epochs=5.0,    # 預熱epochs
         cos_lr=True,          # 使用余弦學習率調度
         close_mosaic=10,      # 最後10個epoch關閉mosaic
         
