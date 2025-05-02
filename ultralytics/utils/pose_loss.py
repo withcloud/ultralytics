@@ -85,6 +85,7 @@ class v8PoseLoss(v8DetectionLoss):
                 self.register_teacher_hooks()
                 # self.register_student_hooks()
                 self.model.train_start = False
+                exit()
         
         # 教師模型推理
         if "teacher" in batch and batch["teacher"] is not None:
