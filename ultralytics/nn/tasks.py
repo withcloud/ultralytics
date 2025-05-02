@@ -306,7 +306,11 @@ class BaseModel(torch.nn.Module):
             teacher = batch["teacher"]
             # 確保教師模型在正確的設備上
             input_device = batch["img"].device
-            if teacher.device != input_device:
+            
+            # 獲取教師模型的設備（使用參數而不是直接訪問 device 屬性）
+            teacher_device = next(teacher.parameters()).device if list(teacher.parameters()) else input_device
+            
+            if teacher_device != input_device:
                 teacher = teacher.to(input_device)
                 batch["teacher"] = teacher
             

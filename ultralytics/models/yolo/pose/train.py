@@ -186,6 +186,22 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             gpu_id = self.device.index if hasattr(self.device, 'index') else 0
             log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
             
+            # 確保教師模型在正確的設備上
+            if "img" in batch:
+                input_device = batch["img"].device
+                # 安全地獲取教師模型的設備
+                try:
+                    has_params = any(True for _ in self.teacher.parameters())
+                    if has_params:
+                        teacher_device = next(self.teacher.parameters()).device
+                        if teacher_device != input_device:
+                            self.teacher = self.teacher.to(input_device)
+                            LOGGER.info(f"{log_prefix}將教師模型從 {teacher_device} 移動到 {input_device}")
+                    else:
+                        LOGGER.warning(f"{log_prefix}教師模型似乎沒有參數")
+                except Exception as e:
+                    LOGGER.warning(f"{log_prefix}檢查教師模型設備時出錯: {str(e)}")
+            
             # 確保特徵收集勾子存在
             if not self.teacher_hooks:
                 LOGGER.warning(f"{log_prefix}重新註冊教師模型勾子")

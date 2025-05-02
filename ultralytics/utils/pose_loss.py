@@ -146,7 +146,11 @@ class v8PoseLoss(v8DetectionLoss):
                     try:
                         # 確保設備相符
                         input_device = batch["img"].device
-                        teacher = teacher.to(input_device)
+                        # 使用參數獲取教師模型的設備
+                        teacher_device = next(teacher.parameters()).device if list(teacher.parameters()) else input_device
+                        
+                        if teacher_device != input_device:
+                            teacher = teacher.to(input_device)
                         
                         # 執行前向傳播
                         _ = teacher(batch["img"])
