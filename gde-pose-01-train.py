@@ -39,7 +39,7 @@ def main():
         # 蒸餾參數
         teacher="yolo11n-pose.pt",
         target_layers=["model.0.conv", "model.1.conv"],
-        distill=0.001,           # 較高蒸餾權重
+        distill=0.0001,           # 較高蒸餾權重
         freezeAllBN=True,
 
         box=0.0, # (float) box loss gain
