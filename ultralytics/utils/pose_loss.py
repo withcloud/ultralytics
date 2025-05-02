@@ -132,9 +132,33 @@ class v8PoseLoss(v8DetectionLoss):
         should_log = self.batch_counter % self.log_interval == 0  # Only log every log_interval batches
         
         if "teacher" in batch and batch["teacher"] is not None and "teacher_features" in batch and "student_features" in batch:
-            # Get the cached features from the batch
+            # 確保教師模型前向傳播已執行並收集特徵
+            teacher = batch["teacher"]
             teacher_features = batch["teacher_features"]
             student_features = batch["student_features"]
+            
+            # 如果特徵未收集（字典為空），執行前向傳播
+            if not teacher_features and teacher is not None:
+                if should_log:
+                    LOGGER.info(f"{log_prefix}執行教師模型前向傳播以收集特徵...")
+                
+                with torch.no_grad():
+                    try:
+                        # 確保設備相符
+                        input_device = batch["img"].device
+                        teacher = teacher.to(input_device)
+                        
+                        # 執行前向傳播
+                        _ = teacher(batch["img"])
+                        
+                        # 更新特徵
+                        teacher_features = batch["teacher_features"]
+                        
+                        if should_log and not teacher_features:
+                            LOGGER.warning(f"{log_prefix}教師模型前向傳播後仍無特徵，請檢查勾子註冊")
+                    except Exception as e:
+                        if should_log:
+                            LOGGER.error(f"{log_prefix}教師模型前向傳播錯誤: {str(e)}")
             
             # Check if we have features to compare
             if teacher_features and student_features:
@@ -151,33 +175,85 @@ class v8PoseLoss(v8DetectionLoss):
                 if not target_layers:
                     if should_log:
                         LOGGER.warning(f"{log_prefix}教師和學生模型沒有共同的特徵層，無法計算蒸餾損失")
+                        LOGGER.warning(f"{log_prefix}教師特徵層: {list(teacher_features.keys())}")
+                        LOGGER.warning(f"{log_prefix}學生特徵層: {list(student_features.keys())}")
                     loss[5] = torch.tensor(0.0, device=self.device, requires_grad=True)
                 else:
                     if should_log:
-                        LOGGER.info(f"{log_prefix}計算蒸餾損失，目標層數: {len(target_layers)}")
+                        LOGGER.info(f"{log_prefix}計算蒸餾損失，目標層數: {len(target_layers)}, 層索引: {target_layers}")
                     
                     # Calculate distillation loss for each layer
                     distill_losses = []
                     for layer_idx in target_layers:
-                        t_feat = teacher_features[layer_idx].detach()  # Ensure we don't backprop through teacher
+                        t_feat = teacher_features[layer_idx]
                         s_feat = student_features[layer_idx]
+                        
+                        # 檢查是否為 None
+                        if t_feat is None or s_feat is None:
+                            if should_log:
+                                LOGGER.warning(f"{log_prefix}層 {layer_idx} 的特徵為 None，跳過")
+                            continue
                         
                         # 確保特徵在同一設備上
                         current_device = s_feat.device
                         if t_feat.device != current_device:
                             t_feat = t_feat.to(current_device)
                         
+                        # 確保特徵已分離，不會影響教師模型的梯度
+                        t_feat = t_feat.detach()
+                        
                         # Ensure feature shapes match
                         if t_feat.shape != s_feat.shape:
                             if should_log:
                                 LOGGER.warning(f"{log_prefix}層 {layer_idx} 的特徵形狀不匹配: 教師 {t_feat.shape} vs 學生 {s_feat.shape}")
+                                
+                            # 嘗試調整形狀以匹配
+                            try:
+                                # 如果教師特徵與學生特徵的通道數不同，可以使用 1x1 卷積進行調整
+                                # 這裡我們使用簡單的方法，只保留共同的維度
+                                if len(t_feat.shape) == len(s_feat.shape):
+                                    # 找出每個維度的最小值
+                                    min_dims = [min(td, sd) for td, sd in zip(t_feat.shape, s_feat.shape)]
+                                    # 裁剪兩個特徵到相同大小
+                                    if len(min_dims) == 4:  # 典型的卷積特徵 [batch, channels, height, width]
+                                        t_feat = t_feat[:min_dims[0], :min_dims[1], :min_dims[2], :min_dims[3]]
+                                        s_feat = s_feat[:min_dims[0], :min_dims[1], :min_dims[2], :min_dims[3]]
+                                        if should_log:
+                                            LOGGER.info(f"{log_prefix}調整後的特徵形狀: {t_feat.shape}")
+                                    else:
+                                        # 其他情況，繼續嘗試下一層
+                                        continue
+                                else:
+                                    # 維度數不同，跳過此層
+                                    continue
+                            except Exception as e:
+                                if should_log:
+                                    LOGGER.warning(f"{log_prefix}調整特徵形狀時出錯: {str(e)}")
+                                continue
+                        
+                        # 確保 t_feat 和 s_feat 不是標量
+                        if t_feat.numel() == 1 or s_feat.numel() == 1:
+                            if should_log:
+                                LOGGER.warning(f"{log_prefix}層 {layer_idx} 的特徵是標量，跳過")
                             continue
                         
-                        layer_loss = self.mse_loss(s_feat, t_feat)
-                        distill_losses.append(layer_loss)
-                        
-                        if should_log:
-                            LOGGER.info(f"{log_prefix}層 {layer_idx} 的蒸餾損失: {layer_loss.item():.5f}")
+                        # 計算 MSE 損失
+                        try:
+                            layer_loss = self.mse_loss(s_feat, t_feat)
+                            # 檢查損失是否為 NaN 或無限大
+                            if torch.isnan(layer_loss) or torch.isinf(layer_loss):
+                                if should_log:
+                                    LOGGER.warning(f"{log_prefix}層 {layer_idx} 的蒸餾損失為 NaN 或無限，跳過")
+                                continue
+                                
+                            distill_losses.append(layer_loss)
+                            
+                            if should_log:
+                                LOGGER.info(f"{log_prefix}層 {layer_idx} 的蒸餾損失: {layer_loss.item():.5f}")
+                        except Exception as e:
+                            if should_log:
+                                LOGGER.warning(f"{log_prefix}計算層 {layer_idx} 的蒸餾損失時出錯: {str(e)}")
+                            continue
                     
                     if distill_losses:
                         # Combine all layer losses
@@ -186,13 +262,27 @@ class v8PoseLoss(v8DetectionLoss):
                         if should_log:
                             LOGGER.info(f"{log_prefix}總蒸餾損失 (未加權): {loss[5].item():.5f}")
                     else:
+                        if should_log:
+                            LOGGER.warning(f"{log_prefix}沒有計算出有效的蒸餾損失")
                         loss[5] = torch.tensor(0.0, device=self.device, requires_grad=True)
             else:
                 # No features collected yet
                 if should_log:
                     LOGGER.warning(f"{log_prefix}沒有收集到特徵，無法計算蒸餾損失")
+                    LOGGER.warning(f"{log_prefix}教師特徵: {bool(teacher_features)}, 學生特徵: {bool(student_features)}")
                 loss[5] = torch.tensor(0.0, device=self.device, requires_grad=True)
         else:
+            if should_log:
+                missing = []
+                if "teacher" not in batch:
+                    missing.append("teacher")
+                elif batch["teacher"] is None:
+                    missing.append("teacher (None)")
+                if "teacher_features" not in batch:
+                    missing.append("teacher_features")
+                if "student_features" not in batch:
+                    missing.append("student_features")
+                LOGGER.warning(f"{log_prefix}缺少蒸餾所需的組件: {', '.join(missing)}")
             loss[5] = torch.tensor(0.0, device=self.device, requires_grad=True)
 
         loss[0] *= self.hyp.box  # box gain

@@ -49,6 +49,11 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         Args:
             cfg (dict, optional): Default configuration dictionary containing training parameters.
             overrides (dict, optional): Dictionary of parameter overrides for the default configuration.
+                Supported distillation parameters:
+                - teacher: Path to teacher model weights file
+                - distill: Weight for distillation loss (default: 1.0)
+                - freezeAllBN: Whether to freeze all BatchNorm layers (default: False)
+                - target_layers: List of layer indices or names for feature distillation (default: [6, 8, 10])
             _callbacks (list, optional): List of callback functions to be executed during training.
 
         Notes:
@@ -69,7 +74,13 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         self.teacher = None  # Initialized to None, will load the model later
         self.distill = overrides.get("distill", 1.0)
         self.freezeAllBN = overrides.get("freezeAllBN", False)
-        self.target_layers = overrides.get("target_layers", [])
+        
+        # 默認目標層 - 通常中間層效果較好用於特徵蒸餾
+        default_layers = [6, 8, 10]  # 預設使用中間層進行特徵蒸餾
+        self.target_layers = overrides.get("target_layers", default_layers)
+        if not self.target_layers and self.teacher_path:
+            LOGGER.warning(f"未指定目標層，使用默認值: {default_layers}，可通過 'target_layers' 參數指定")
+            self.target_layers = default_layers
         
         # For collecting features from layers
         self.teacher_features = {}
@@ -86,7 +97,8 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             
             if _callbacks is None:
                 _callbacks = callbacks.get_default_callbacks()
-
+            
+            # 確保所有必要的回調都被註冊
             _callbacks["on_train_start"].append(self.on_train_start)
             _callbacks["on_train_epoch_start"].append(self.on_epoch_start)
             _callbacks["on_train_epoch_end"].append(self.on_epoch_end)
@@ -95,6 +107,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             _callbacks["on_train_end"].append(self.on_train_end)
             _callbacks["teardown"].append(self.teardown)
             _callbacks["on_batch_end"].append(self.on_batch_end)
+            _callbacks["on_train_batch_start"].append(self.on_train_batch_start)  # 新添加的批次開始回調
 
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
@@ -149,10 +162,53 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 # Log process ID for debugging
                 LOGGER.info(f"{log_prefix}Process ID: {os.getpid()}")
                 
+                # 確保立即註冊 hook
+                self.register_teacher_hooks()
+                
             except Exception as e:
                 LOGGER.error(f"{log_prefix}Error loading teacher model: {str(e)}")
                 raise
+    
+    def ensure_features_collection(self, batch):
+        """確保在前向傳播之前清除特徵並在之後收集特徵"""
+        if self.teacher is not None:
+            # 清除先前的特徵
+            self.teacher_features = {}
+            self.student_features = {}
             
+            # 獲取當前設備和批次信息
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+            
+            # 確保特徵收集勾子存在
+            if not self.teacher_hooks:
+                LOGGER.warning(f"{log_prefix}重新註冊教師模型勾子")
+                self.register_teacher_hooks()
+            
+            if not self.student_hooks:
+                LOGGER.warning(f"{log_prefix}重新註冊學生模型勾子")
+                self.register_student_hooks()
+                
+            # 記錄勾子數量
+            LOGGER.info(f"{log_prefix}當前教師模型勾子數: {len(self.teacher_hooks)}, 學生模型勾子數: {len(self.student_hooks)}")
+            
+            # 將教師模型和特徵添加到批次
+            batch["teacher"] = self.teacher
+            batch["teacher_features"] = self.teacher_features
+            batch["student_features"] = self.student_features
+            
+        return batch
+            
+    def preprocess_batch(self, batch):
+        """處理每個批次數據，添加教師模型和特徵到批次中"""
+        batch = super().preprocess_batch(batch)
+        
+        # 確保特徵被正確收集
+        batch = self.ensure_features_collection(batch)
+        
+        return batch
+
     def register_teacher_hooks(self):
         """Register hooks on the teacher model to capture intermediate features."""
         if self.teacher is not None:
@@ -177,9 +233,13 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             for target in self.target_layers:
                 if isinstance(target, int):
                     # 如果是整數索引，直接獲取對應層
-                    layer = self.teacher.model[target]
-                    layer_full_name = f"model.{target}"
-                    layer_idx = target  # 用於hook的layer_idx
+                    try:
+                        layer = self.teacher.model[target]
+                        layer_full_name = f"model.{target}"
+                        layer_idx = target  # 用於hook的layer_idx
+                    except IndexError:
+                        LOGGER.warning(f"{log_prefix}教師模型中不存在索引 {target}，跳過")
+                        continue
                 else:
                     # 如果是字符串路徑，從module_dict中查找
                     if target in module_dict:
@@ -228,6 +288,13 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 self.teacher_hooks.append(layer.register_forward_hook(
                     lambda module, input, output, idx=layer_idx: self._save_teacher_feature(idx, output)))
             
+            # 在模型的前向傳播開始之前註冊一個鉤子，用於清空特徵
+            def pre_forward_hook(module, input):
+                self.teacher_features = {}
+                return None
+            
+            self.teacher_hooks.append(self.teacher.register_forward_pre_hook(pre_forward_hook))
+            
             LOGGER.info(f"{log_prefix}教師模型勾子註冊完成，共 {len(self.teacher_hooks)} 個勾子")
             
     def register_student_hooks(self):
@@ -253,9 +320,13 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         for target in self.target_layers:
             if isinstance(target, int):
                 # 如果是整數索引，直接獲取對應層
-                layer = self.model.model[target]
-                layer_full_name = f"model.{target}"
-                layer_idx = target  # 用於hook的layer_idx
+                try:
+                    layer = self.model.model[target]
+                    layer_full_name = f"model.{target}"
+                    layer_idx = target  # 用於hook的layer_idx
+                except IndexError:
+                    LOGGER.warning(f"{log_prefix}學生模型中不存在索引 {target}，跳過")
+                    continue
             else:
                 # 如果是字符串路徑，從module_dict中查找
                 if target in module_dict:
@@ -300,11 +371,22 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             
             LOGGER.info(f"{log_prefix}{layer_info}")
             
-            # 註冊勾子
+            # 註冊勾子，在每次前向傳播前清空特徵
+            def forward_hook(module, input, output, idx=layer_idx):
+                self._save_student_feature(idx, output)
+                return None
+            
             self.student_hooks.append(layer.register_forward_hook(
                 lambda module, input, output, idx=layer_idx: self._save_student_feature(idx, output)))
                 
         LOGGER.info(f"{log_prefix}學生模型勾子註冊完成，共 {len(self.student_hooks)} 個勾子")
+        
+        # 在模型的前向傳播開始之前註冊一個鉤子，用於清空特徵
+        def pre_forward_hook(module, input):
+            self.student_features = {}
+            return None
+        
+        self.student_hooks.append(self.model.register_forward_pre_hook(pre_forward_hook))
 
     def _save_teacher_feature(self, layer_idx, feature):
         """Save features from the teacher model."""
@@ -329,19 +411,6 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                     m.eval()  # 只有BN層設為評估模式
                     for param in m.parameters():
                         param.requires_grad = False
-
-    def preprocess_batch(self, batch):
-        batch = super().preprocess_batch(batch)
-
-        # Add teacher to batch if it exists
-        if self.teacher is not None:
-            batch["teacher"] = self.teacher
-                
-            # Store features in the batch
-            batch["teacher_features"] = self.teacher_features
-            batch["student_features"] = self.student_features
-
-        return batch
 
     def on_train_start(self, trainer):
         # Get rank for distributed training
@@ -453,6 +522,30 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
     def on_batch_end(self, trainer):
         self.model.is_first_batch_in_epoch = False
         pass
+        
+    def on_train_batch_start(self, trainer):
+        """在每個訓練批次開始時調用，確保特徵清理"""
+        # 清理特徵
+        self.teacher_features = {}
+        self.student_features = {}
+        
+        # 重新檢查勾子
+        if self.teacher is not None:
+            # 每 10 批次檢查一次勾子是否正常
+            if trainer.epoch % 10 == 0 and trainer.batch % 10 == 0:
+                # 獲取進程和設備信息
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+                log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+                
+                # 檢查勾子數量
+                if not self.teacher_hooks or len(self.teacher_hooks) < len(self.target_layers):
+                    LOGGER.warning(f"{log_prefix}教師模型勾子數量不足或為空，重新註冊")
+                    self.register_teacher_hooks()
+                
+                if not self.student_hooks:
+                    LOGGER.warning(f"{log_prefix}學生模型勾子數量不足或為空，重新註冊")
+                    self.register_student_hooks()
 
     def set_target_layers(self, new_target_layers):
         """

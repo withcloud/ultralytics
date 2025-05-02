@@ -300,18 +300,18 @@ class BaseModel(torch.nn.Module):
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
 
-        # Handle teacher if it exists in the batch
-        # The teacher model will now be loaded separately on each GPU
-        # and the forward pass will be done here
+        # Handle teacher if it exists in the batch - mainly for device checking
+        # Actual feature collection is now handled in pose_loss.py
         if "teacher" in batch and batch["teacher"] is not None:
             teacher = batch["teacher"]
             # 確保教師模型在正確的設備上
             input_device = batch["img"].device
-            teacher = teacher.to(input_device)
+            if teacher.device != input_device:
+                teacher = teacher.to(input_device)
+                batch["teacher"] = teacher
             
-            with torch.no_grad():
-                teacher_preds = teacher(batch["img"])
-            batch["teacher_preds"] = teacher_preds
+            # 不再在此處執行教師模型的前向傳播
+            # 已在 pose_loss.py 中處理
 
         preds = self.forward(batch["img"]) if preds is None else preds
         return self.criterion(preds, batch)
