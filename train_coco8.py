@@ -25,6 +25,19 @@ warnings.filterwarnings("ignore", message="Grad strides do not match bucket view
 # 忽略除零警告
 warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
 
+def print_from_all_processes(message):
+    """確保所有進程打印信息"""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    print(f"[Rank {local_rank}, GPU {local_rank}] {message}")
+    
+    if world_size > 1:
+        dist.barrier()  # 同步所有進程
+
+# 在訓練程式的適當位置調用這個函數
+print_from_all_processes(f"Starting training on GPU {torch.cuda.get_device_name()}")
+
 def main():
     # Load a model
     model = YOLO("yolo11n-pose.pt")
