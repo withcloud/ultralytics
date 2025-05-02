@@ -41,6 +41,12 @@ def main():
         target_layers=["model.0.conv", "model.1.conv"],
         distill=0.001,           # 較高蒸餾權重
         freezeAllBN=True,
+
+        box=0.0, # (float) box loss gain
+        cls=0.0, # (float) cls loss gain (scale with pixels)
+        dfl=0.0, # (float) dfl loss gain
+        pose=0.0, # (float) pose loss gain
+        kobj=0.0, # (float) keypoint obj loss gain
         
         # 優化器設置
         optimizer="Adam",
