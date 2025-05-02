@@ -1,148 +1,81 @@
 import os
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-import time
+from ultralytics import YOLO
+from ultralytics.utils import LOGGER
+import sys
+import warnings
 
-# 簡單的資料集
-class DummyDataset(Dataset):
-    def __init__(self, size=1000):
-        self.size = size
-        self.data = torch.randn(size, 20)
-        self.targets = torch.randint(0, 2, (size,))
-        
-    def __len__(self):
-        return self.size
-    
-    def __getitem__(self, idx):
-        return self.data[idx], self.targets[idx]
+# 強制所有進程輸出日誌
+os.environ["RANK"] = "-1"
 
-# 簡單的模型
-class SimpleModel(nn.Module):
-    def __init__(self):
-        super(SimpleModel, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(20, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2)
-        )
-        
-    def forward(self, x):
-        return self.layers(x)
+# 設置環境變量，強制所有進程輸出日誌
+os.environ["RANK"] = "-1"  # 覆蓋 rank 檢查
+LOGGER.setLevel('INFO')  # 設置日誌級別
 
-# 為每個進程設置分佈式環境
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    
-    # 初始化進程組
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+# 添加本地路徑到 Python 路徑中，確保使用本地版本
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, current_dir)
+sys.path.insert(0, parent_dir)
 
-# 清理分佈式環境
-def cleanup():
-    dist.destroy_process_group()
+# 設置環境變量，確保分佈式訓練使用本地代碼
+os.environ["PYTHONPATH"] = f"{current_dir}:{os.environ.get('PYTHONPATH', '')}"
+# 忽略 DDP 的 stride 不匹配警告
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
+# 忽略除零警告
+warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
 
-# 每個 GPU 執行的訓練函數
-def train(rank, world_size):
-    # 初始化分佈式環境
-    setup(rank, world_size)
-    
-    # 打印當前進程信息，確保所有 GPU 都有日誌
-    print(f"[GPU {rank}] 進程初始化完成，世界大小: {world_size}")
-    
-    # 創建模型並移至對應 GPU
-    model = SimpleModel().to(rank)
-    # 轉換為 DDP 模型
-    ddp_model = DDP(model, device_ids=[rank])
-    
-    # 打印模型位置信息
-    print(f"[GPU {rank}] 模型已創建並放置於 device {rank}")
-    
-    # 創建資料集和資料載入器
-    dataset = DummyDataset(1000)
-    # 使用 DistributedSampler 來分配資料給不同進程
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
-    
-    print(f"[GPU {rank}] 資料載入器已創建，批次大小: 32，批次數: {len(dataloader)}")
-    
-    # 定義損失函數和優化器
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(ddp_model.parameters(), lr=0.01)
-    
-    # 訓練迴圈
-    epochs = 3
-    for epoch in range(epochs):
-        # 設置 sampler 的 epoch 屬性，確保洗牌不同
-        sampler.set_epoch(epoch)
-        
-        # 開始時間
-        start_time = time.time()
-        
-        # 記錄總損失
-        total_loss = 0.0
-        
-        # 同步進程進入訓練階段
-        print(f"[GPU {rank}] Epoch {epoch+1}/{epochs} 開始訓練")
-        if dist.is_initialized():
-            dist.barrier()
-        
-        # 一個 epoch 的訓練迴圈
-        for i, (inputs, targets) in enumerate(dataloader):
-            # 將資料移至對應 GPU
-            inputs, targets = inputs.to(rank), targets.to(rank)
-            
-            # 前向傳播
-            outputs = ddp_model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # 反向傳播和優化
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # 累計損失
-            total_loss += loss.item()
-            
-            # 每 10 個批次打印一次
-            if (i + 1) % 10 == 0:
-                print(f"[GPU {rank}] Epoch {epoch+1}, Batch {i+1}/{len(dataloader)}, Loss: {loss.item():.4f}")
-        
-        # 計算平均損失
-        avg_loss = total_loss / len(dataloader)
-        # 計算訓練時間
-        epoch_time = time.time() - start_time
-        
-        # 每個 epoch 結束時打印統計信息
-        print(f"[GPU {rank}] Epoch {epoch+1} 完成, 平均損失: {avg_loss:.4f}, 訓練時間: {epoch_time:.2f} 秒")
-        
-        # 同步所有進程在 epoch 結束
-        if dist.is_initialized():
-            dist.barrier()
-    
-    # 清理
-    cleanup()
+
+def on_pretrain_routine_start(trainer):
+    """在預訓練開始時從所有 GPU 記錄信息"""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    gpu_name = torch.cuda.get_device_name(local_rank) if torch.cuda.is_available() else "CPU"
+    print(f"[Rank {local_rank}, GPU {local_rank}] Starting pre-training on {gpu_name}")
+
+
+def on_train_epoch_start(trainer):
+    """在每個訓練 epoch 開始時從所有 GPU 記錄信息"""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    print(f"[Rank {local_rank}, GPU {local_rank}] Starting epoch {trainer.epoch}")
+
+
+def on_train_batch_end(trainer):
+    """在每個訓練批次結束時從所有 GPU 記錄信息"""
+    # 每 10 個批次記錄一次，避免日誌過多
+    if trainer.batch_idx % 10 == 0:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        loss = trainer.loss.item() if hasattr(trainer.loss, 'item') else trainer.loss
+        print(f"[Rank {local_rank}, GPU {local_rank}] Batch {trainer.batch_idx}, Loss: {loss:.4f}")
+
+
+def on_val_start(validator):
+    """在驗證開始時從所有 GPU 記錄信息"""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    print(f"[Rank {local_rank}, GPU {local_rank}] Starting validation")
+
 
 def main():
-    # 獲取可用的 GPU 數量
-    world_size = torch.cuda.device_count()
-    print(f"發現 {world_size} 個 GPU")
+    # 載入模型
+    model = YOLO("yolo11n-pose.pt")
     
-    if world_size < 2:
-        print("需要至少 2 個 GPU 來演示多 GPU 訓練")
-        return
-    
-    # 使用 mp.spawn 同時啟動多個進程
-    mp.spawn(
-        train,
-        args=(world_size,),
-        nprocs=world_size,
-        join=True
+    # 按照官方用法添加回調
+    model.add_callback("on_pretrain_routine_start", on_pretrain_routine_start)
+    model.add_callback("on_train_epoch_start", on_train_epoch_start)
+    model.add_callback("on_train_batch_end", on_train_batch_end)
+    model.add_callback("on_val_start", on_val_start)
+
+    # 訓練模型
+    results = model.train(
+        data="coco8-pose.yaml",
+        epochs=20,
+        imgsz=640,
+        device=[0, 1],
+        teacher="yolo11n-pose.pt",
+        target_layers=["model.0.conv", 1],
+        verbose=True,
     )
+
 
 if __name__ == "__main__":
     main()
