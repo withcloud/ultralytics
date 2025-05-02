@@ -10,7 +10,6 @@ from ultralytics.utils.plotting import plot_images, plot_results
 import torch
 import torch.distributed as dist
 from ultralytics.nn.tasks import attempt_load_weights
-import torch.nn.functional as F
 
 
 class PoseTrainer(yolo.detect.DetectionTrainer):
@@ -76,30 +75,17 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         self.distill = overrides.get("distill", 1.0)
         self.freezeAllBN = overrides.get("freezeAllBN", False)
         
-        # 輸出更詳細的初始化信息
-        rank = 0  # 在初始化階段還沒有 dist.get_rank()
-        if 'RANK' in os.environ:
-            rank = int(os.environ['RANK'])
-        log_prefix = f"[Rank {rank}] "
-        
-        # 新的默認目標層 - 使用早期的層以確保更容易匹配
-        default_layers = ["model.0", "model.1", "model.2"]  # 使用模型前面的層，這些層通常存在於所有模型中
-        
-        # 從配置中獲取目標層
+        # 默認目標層 - 在 DDP 環境中使用字符串路徑而不是索引
+        default_layers = ["model.6", "model.8", "model.10"]  # 使用模塊路徑代替索引
         self.target_layers = overrides.get("target_layers", default_layers)
-        
-        # 輸出目標層信息
-        LOGGER.info(f"{log_prefix}使用以下目標層進行蒸餾: {self.target_layers}")
-        
         if not self.target_layers and self.teacher_path:
-            LOGGER.warning(f"{log_prefix}未指定目標層，使用默認值: {default_layers}，可通過 'target_layers' 參數指定")
+            LOGGER.warning(f"未指定目標層，使用默認值: {default_layers}，可通過 'target_layers' 參數指定")
             self.target_layers = default_layers
         
         # 將索引轉換為字符串路徑，避免 DDP 環境中的問題
         for i, layer in enumerate(self.target_layers):
             if isinstance(layer, int):
                 self.target_layers[i] = f"model.{layer}"
-                LOGGER.info(f"{log_prefix}將索引 {layer} 轉換為路徑 'model.{layer}'")
         
         # For collecting features from layers
         self.teacher_features = {}
@@ -112,7 +98,6 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 
         # Now we can initialize the teacher model since self.device is available
         if self.teacher_path is not None:
-            LOGGER.info(f"{log_prefix}將初始化教師模型: {self.teacher_path}")
             self.init_teacher_model()
             
             if _callbacks is None:
@@ -190,89 +175,62 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 raise
     
     def ensure_features_collection(self, batch):
-        """Ensure features are collected by running forward pass if needed."""
-        # Get rank for distributed training
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
-        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
-        
-        # Clear features explicitly
-        self.teacher_features = {}
-        self.student_features = {}
-        
-        # Add teacher to batch if not present
-        if self.teacher is not None and "teacher" not in batch:
-            batch["teacher"] = self.teacher
-            
-        # Add feature containers to batch
-        batch["teacher_features"] = self.teacher_features
-        batch["student_features"] = self.student_features
-        
-        # Get image device
-        input_device = batch["img"].device
-        
-        # 確保教師模型在前向傳播前已經被註冊了勾子
-        if len(self.teacher_hooks) == 0 and self.teacher is not None:
-            LOGGER.warning(f"{log_prefix}教師模型沒有註冊勾子，正在重新註冊...")
-            self.register_teacher_hooks()
-            
-        # 確保學生模型在前向傳播前已經被註冊了勾子
-        if len(self.student_hooks) == 0:
-            LOGGER.warning(f"{log_prefix}學生模型沒有註冊勾子，正在重新註冊...")
-            self.register_student_hooks()
-        
-        LOGGER.info(f"{log_prefix}當前教師模型勾子數: {len(self.teacher_hooks)}, 學生模型勾子數: {len(self.student_hooks)}")
-        
-        # 強制執行教師模型前向傳播以收集特徵 (明確指定)
+        """確保在前向傳播之前清除特徵並在之後收集特徵"""
         if self.teacher is not None:
-            try:
-                LOGGER.info(f"{log_prefix}執行教師模型前向傳播以收集特徵...")
-                
-                # 確保教師模型處於評估模式
-                self.teacher.eval()
-                
-                # 確保教師模型在正確的設備上
-                teacher_device = None
+            # 清除先前的特徵
+            self.teacher_features = {}
+            self.student_features = {}
+            
+            # 獲取當前設備和批次信息
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+            
+            # 確保教師模型在正確的設備上
+            if "img" in batch:
+                input_device = batch["img"].device
+                # 安全地獲取教師模型的設備
                 try:
-                    # 嘗試獲取模型設備
-                    if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
-                        teacher_device = next(self.teacher.module.parameters()).device
-                    else:
+                    has_params = any(True for _ in self.teacher.parameters())
+                    if has_params:
                         teacher_device = next(self.teacher.parameters()).device
-                    
-                    if teacher_device != input_device:
-                        LOGGER.info(f"{log_prefix}教師模型設備 ({teacher_device}) 與輸入設備 ({input_device}) 不匹配，正在移動模型...")
-                        if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
-                            # 對於 DDP 模型，我們不能直接移動模型
-                            LOGGER.warning(f"{log_prefix}教師模型是 DDP 模型，無法直接移動。請確保模型與輸入在相同設備上。")
-                        else:
+                        if teacher_device != input_device:
                             self.teacher = self.teacher.to(input_device)
-                            LOGGER.info(f"{log_prefix}教師模型已移至 {input_device}")
-                except Exception as e:
-                    LOGGER.warning(f"{log_prefix}獲取教師模型設備時發生錯誤: {str(e)}")
-                
-                # 執行前向傳播 (不計算梯度)
-                with torch.no_grad():
-                    _ = self.teacher(batch["img"])
-                
-                # 檢查是否收集到了特徵
-                if not self.teacher_features:
-                    LOGGER.warning(f"{log_prefix}教師模型前向傳播後仍無特徵，請檢查勾子註冊")
-                    
-                    # 檢查模型結構
-                    if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
-                        LOGGER.info(f"{log_prefix}使用目標層: {self.target_layers}")
-                        LOGGER.info(f"{log_prefix}模型類型: {type(self.teacher).__name__}, 模塊類型: {type(self.teacher.module).__name__}")
+                            LOGGER.info(f"{log_prefix}將教師模型從 {teacher_device} 移動到 {input_device}")
                     else:
-                        LOGGER.info(f"{log_prefix}使用目標層: {self.target_layers}")
-                        LOGGER.info(f"{log_prefix}模型類型: {type(self.teacher).__name__}")
-            except Exception as e:
-                LOGGER.error(f"{log_prefix}執行教師模型前向傳播時發生錯誤: {str(e)}")
-        
-        # 將教師特徵更新到批次中
-        batch["teacher_features"] = self.teacher_features
-        batch["student_features"] = self.student_features
-        
+                        LOGGER.warning(f"{log_prefix}教師模型似乎沒有參數")
+                except Exception as e:
+                    LOGGER.warning(f"{log_prefix}檢查教師模型設備時出錯: {str(e)}")
+            
+            # 確保特徵收集勾子存在
+            if not self.teacher_hooks:
+                LOGGER.warning(f"{log_prefix}重新註冊教師模型勾子")
+                self.register_teacher_hooks()
+            
+            if not self.student_hooks:
+                LOGGER.warning(f"{log_prefix}重新註冊學生模型勾子")
+                self.register_student_hooks()
+                
+            # 記錄勾子數量
+            LOGGER.info(f"{log_prefix}當前教師模型勾子數: {len(self.teacher_hooks)}, 學生模型勾子數: {len(self.student_hooks)}")
+            
+            # 將教師模型和特徵添加到批次
+            batch["teacher"] = self.teacher
+            batch["teacher_features"] = self.teacher_features
+            batch["student_features"] = self.student_features
+            
+            # 在 DDP 環境下記錄目標層細節，幫助調試
+            if dist.is_initialized() and rank > 0:  # 只在非主要進程上記錄
+                LOGGER.info(f"{log_prefix}使用目標層: {self.target_layers}")
+                # 檢查模型結構
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    model_str = "DistributedDataParallel"
+                    module_str = str(type(self.model.module))
+                else:
+                    model_str = str(type(self.model))
+                    module_str = "N/A"
+                LOGGER.info(f"{log_prefix}模型類型: {model_str}, 模塊類型: {module_str}")
+            
         return batch
             
     def preprocess_batch(self, batch):
@@ -284,89 +242,6 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         
         return batch
 
-    def _find_layer(self, model, layer_id):
-        """查找模型中的指定層"""
-        # 獲取進程和設備信息
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
-        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
-        
-        # 檢查是否為 DDP 模型
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            LOGGER.info(f"{log_prefix}在 DDP 模型中查找層: {layer_id}")
-            base_model = model.module
-        else:
-            base_model = model
-        
-        # 嘗試不同的方式查找層
-        layer = None
-        error_messages = []
-        
-        # 1. 直接使用整數索引
-        if isinstance(layer_id, int):
-            try:
-                layer = base_model.model[layer_id]
-                LOGGER.info(f"{log_prefix}使用整數索引 {layer_id} 找到層: {type(layer).__name__}")
-                return layer
-            except (IndexError, AttributeError) as e:
-                error_messages.append(f"使用整數索引失敗: {str(e)}")
-        
-        # 2. 使用字符串路徑 (例如 "model.0")
-        elif isinstance(layer_id, str):
-            # 移除 "model." 前綴以獲取索引
-            if layer_id.startswith("model."):
-                try:
-                    idx = int(layer_id.split(".")[1])
-                    if "conv" in layer_id:  # 處理 "model.0.conv" 格式
-                        try:
-                            layer = base_model.model[idx].conv
-                            LOGGER.info(f"{log_prefix}使用路徑 {layer_id} 找到層: {type(layer).__name__}")
-                            return layer
-                        except (IndexError, AttributeError) as e:
-                            error_messages.append(f"訪問 .conv 失敗: {str(e)}")
-                    else:  # 處理 "model.0" 格式
-                        try:
-                            layer = base_model.model[idx]
-                            LOGGER.info(f"{log_prefix}使用路徑 {layer_id} 找到層: {type(layer).__name__}")
-                            return layer
-                        except (IndexError, AttributeError) as e:
-                            error_messages.append(f"訪問索引失敗: {str(e)}")
-                except (ValueError, IndexError) as e:
-                    error_messages.append(f"解析索引失敗: {str(e)}")
-        
-        # 3. 嘗試使用 named_modules 查找
-        try:
-            for name, module in base_model.named_modules():
-                if name == layer_id or (layer_id.isdigit() and name == f"model.{layer_id}"):
-                    layer = module
-                    LOGGER.info(f"{log_prefix}使用 named_modules 找到層 {layer_id}: {type(layer).__name__}")
-                    return layer
-        except Exception as e:
-            error_messages.append(f"使用 named_modules 失敗: {str(e)}")
-        
-        # 4. 最後嘗試: 列出可用層
-        try:
-            available_layers = []
-            for i, m in enumerate(base_model.model):
-                available_layers.append(f"model.{i} ({type(m).__name__})")
-                if hasattr(m, 'conv'):
-                    available_layers.append(f"model.{i}.conv ({type(m.conv).__name__})")
-            
-            LOGGER.warning(f"{log_prefix}無法找到層 {layer_id}")
-            LOGGER.info(f"{log_prefix}可用層: {available_layers[:10]}...")
-            if len(available_layers) > 10:
-                LOGGER.info(f"{log_prefix}...以及其他 {len(available_layers)-10} 個層")
-            
-            # 提供建議的目標層
-            suggested_layers = [f"model.{i}" for i in range(min(10, len(list(base_model.model))))]
-            LOGGER.info(f"{log_prefix}建議使用以下層: {suggested_layers}")
-            
-        except Exception as e:
-            error_messages.append(f"列出可用層失敗: {str(e)}")
-            LOGGER.error(f"{log_prefix}所有嘗試均失敗: {error_messages}")
-        
-        return None  # 無法找到層
-    
     def register_teacher_hooks(self):
         """Register hooks on the teacher model to capture intermediate features."""
         if self.teacher is not None:
@@ -389,33 +264,69 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             else:
                 base_teacher = self.teacher
             
-            # 輸出教師模型結構
-            try:
-                model_structure = []
-                for i, layer in enumerate(base_teacher.model):
-                    model_structure.append(f"model.{i}: {type(layer).__name__}")
-                LOGGER.info(f"{log_prefix}教師模型結構: {model_structure[:5]}...")
-                if len(model_structure) > 5:
-                    LOGGER.info(f"{log_prefix}...以及其他 {len(model_structure)-5} 個層")
-            except Exception as e:
-                LOGGER.warning(f"{log_prefix}無法獲取教師模型結構: {str(e)}")
+            # 建立模塊名稱到模塊的映射
+            module_dict = {}
+            for name, module in base_teacher.named_modules():
+                module_dict[name] = module
                 
             # 處理每個目標層
             for target in self.target_layers:
-                # 查找層
-                layer = self._find_layer(base_teacher, target)
+                if isinstance(target, int):
+                    # 如果是整數索引，直接獲取對應層
+                    try:
+                        layer = base_teacher.model[target]
+                        layer_full_name = f"model.{target}"
+                        layer_idx = target  # 用於hook的layer_idx
+                    except IndexError:
+                        LOGGER.warning(f"{log_prefix}教師模型中不存在索引 {target}，跳過")
+                        continue
+                else:
+                    # 如果是字符串路徑，從module_dict中查找
+                    if target in module_dict:
+                        layer = module_dict[target]
+                        layer_full_name = target
+                        # 對於字符串路徑，我們使用一個唯一標識作為layer_idx
+                        layer_idx = target
+                    else:
+                        LOGGER.warning(f"{log_prefix}在教師模型中未找到指定層: {target}")
+                        continue
                 
-                if layer is None:
-                    LOGGER.warning(f"{log_prefix}無法找到教師模型層: {target}，跳過")
-                    continue
+                # 獲取層的類型
+                layer_type = layer.__class__.__name__
                 
-                layer_idx = target  # 用於 hook 的 layer_idx
+                # 構建詳細的層信息
+                layer_info = f"層名稱: {layer_full_name}, 類型: {layer_type}"
+                
+                # 直接檢查該層是否有conv屬性
+                if hasattr(layer, 'conv'):
+                    layer_info += f", 通道數: {layer.conv.out_channels}"
+                else:
+                    # 動態查找所有子模塊中的conv
+                    conv_modules = []
+                    # 獲取層的所有模塊
+                    for name, module in layer.named_modules():
+                        if hasattr(module, 'conv') and name != '':  # 排除模塊本身
+                            if layer_full_name == "model":  # 處理特殊情況
+                                full_path = f"{layer_full_name}.{name}.conv"
+                            else:
+                                full_path = f"{layer_full_name}.{name}.conv" if name else f"{layer_full_name}.conv"
+                            conv_info = f"{full_path}: {module.conv.out_channels}通道"
+                            conv_modules.append(conv_info)
+                    
+                    if conv_modules:
+                        layer_info += f"\n  子模塊包含:"
+                        # 顯示所有conv模塊，但限制數量避免輸出過多
+                        max_show = min(len(conv_modules), 5)
+                        for j in range(max_show):
+                            layer_info += f"\n    - {conv_modules[j]}"
+                        if len(conv_modules) > max_show:
+                            layer_info += f"\n    ... 等{len(conv_modules)}個conv模塊"
+                
+                LOGGER.info(f"{log_prefix}{layer_info}")
                 
                 # 註冊勾子，使用自定義的_save_feature方法並傳遞layer_idx
-                hook = layer.register_forward_hook(
-                    lambda module, input, output, idx=layer_idx: self._save_teacher_feature(idx, output))
-                self.teacher_hooks.append(hook)
-                LOGGER.info(f"{log_prefix}為教師模型層 {target} 註冊了勾子")
+                self.teacher_hooks.append(layer.register_forward_hook(
+                    lambda module, input, output, idx=layer_idx: self._save_teacher_feature(idx, output)))
             
             # 在模型的前向傳播開始之前註冊一個鉤子，用於清空特徵
             def pre_forward_hook(module, input):
@@ -423,17 +334,12 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 return None
             
             if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
-                pre_hook = self.teacher.module.register_forward_pre_hook(pre_forward_hook)
+                self.teacher_hooks.append(self.teacher.module.register_forward_pre_hook(pre_forward_hook))
             else:
-                pre_hook = self.teacher.register_forward_pre_hook(pre_forward_hook)
+                self.teacher_hooks.append(self.teacher.register_forward_pre_hook(pre_forward_hook))
             
-            self.teacher_hooks.append(pre_hook)
+            LOGGER.info(f"{log_prefix}教師模型勾子註冊完成，共 {len(self.teacher_hooks)} 個勾子")
             
-            if not self.teacher_hooks:
-                LOGGER.warning(f"{log_prefix}沒有為教師模型註冊任何勾子！")
-            else:
-                LOGGER.info(f"{log_prefix}教師模型勾子註冊完成，共 {len(self.teacher_hooks)} 個勾子")
-    
     def register_student_hooks(self):
         """Register hooks on the student model to capture intermediate features."""
         # Clear any existing hooks
@@ -454,51 +360,86 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             base_model = self.model.module
         else:
             base_model = self.model
-            
-        # 輸出學生模型結構
-        try:
-            model_structure = []
-            for i, layer in enumerate(base_model.model):
-                model_structure.append(f"model.{i}: {type(layer).__name__}")
-            LOGGER.info(f"{log_prefix}學生模型結構: {model_structure[:5]}...")
-            if len(model_structure) > 5:
-                LOGGER.info(f"{log_prefix}...以及其他 {len(model_structure)-5} 個層")
-        except Exception as e:
-            LOGGER.warning(f"{log_prefix}無法獲取學生模型結構: {str(e)}")
+        
+        # 建立模塊名稱到模塊的映射
+        module_dict = {}
+        for name, module in base_model.named_modules():
+            module_dict[name] = module
             
         # 處理每個目標層
         for target in self.target_layers:
-            # 查找層
-            layer = self._find_layer(base_model, target)
+            if isinstance(target, int):
+                # 如果是整數索引，直接獲取對應層
+                try:
+                    layer = base_model.model[target]
+                    layer_full_name = f"model.{target}"
+                    layer_idx = target  # 用於hook的layer_idx
+                except IndexError:
+                    LOGGER.warning(f"{log_prefix}學生模型中不存在索引 {target}，跳過")
+                    continue
+            else:
+                # 如果是字符串路徑，從module_dict中查找
+                if target in module_dict:
+                    layer = module_dict[target]
+                    layer_full_name = target
+                    # 對於字符串路徑，我們使用一個唯一標識作為layer_idx
+                    layer_idx = target
+                else:
+                    LOGGER.warning(f"{log_prefix}在學生模型中未找到指定層: {target}")
+                    continue
             
-            if layer is None:
-                LOGGER.warning(f"{log_prefix}無法找到學生模型層: {target}，跳過")
-                continue
+            # 獲取層的類型
+            layer_type = layer.__class__.__name__
             
-            layer_idx = target  # 用於 hook 的 layer_idx
+            # 構建詳細的層信息
+            layer_info = f"層名稱: {layer_full_name}, 類型: {layer_type}"
             
-            # 註冊勾子
-            hook = layer.register_forward_hook(
-                lambda module, input, output, idx=layer_idx: self._save_student_feature(idx, output))
-            self.student_hooks.append(hook)
-            LOGGER.info(f"{log_prefix}為學生模型層 {target} 註冊了勾子")
+            # 直接檢查該層是否有conv屬性
+            if hasattr(layer, 'conv'):
+                layer_info += f", 通道數: {layer.conv.out_channels}"
+            else:
+                # 動態查找所有子模塊中的conv
+                conv_modules = []
+                # 獲取層的所有模塊
+                for name, module in layer.named_modules():
+                    if hasattr(module, 'conv') and name != '':  # 排除模塊本身
+                        if layer_full_name == "model":  # 處理特殊情況
+                            full_path = f"{layer_full_name}.{name}.conv"
+                        else:
+                            full_path = f"{layer_full_name}.{name}.conv" if name else f"{layer_full_name}.conv"
+                        conv_info = f"{full_path}: {module.conv.out_channels}通道"
+                        conv_modules.append(conv_info)
                 
+                if conv_modules:
+                    layer_info += f"\n  子模塊包含:"
+                    # 顯示所有conv模塊，但限制數量避免輸出過多
+                    max_show = min(len(conv_modules), 5)
+                    for j in range(max_show):
+                        layer_info += f"\n    - {conv_modules[j]}"
+                    if len(conv_modules) > max_show:
+                        layer_info += f"\n    ... 等{len(conv_modules)}個conv模塊"
+            
+            LOGGER.info(f"{log_prefix}{layer_info}")
+            
+            # 註冊勾子，在每次前向傳播前清空特徵
+            def forward_hook(module, input, output, idx=layer_idx):
+                self._save_student_feature(idx, output)
+                return None
+            
+            self.student_hooks.append(layer.register_forward_hook(
+                lambda module, input, output, idx=layer_idx: self._save_student_feature(idx, output)))
+                
+        LOGGER.info(f"{log_prefix}學生模型勾子註冊完成，共 {len(self.student_hooks)} 個勾子")
+        
         # 在模型的前向傳播開始之前註冊一個鉤子，用於清空特徵
         def pre_forward_hook(module, input):
             self.student_features = {}
             return None
         
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-            pre_hook = self.model.module.register_forward_pre_hook(pre_forward_hook)
+            self.student_hooks.append(self.model.module.register_forward_pre_hook(pre_forward_hook))
         else:
-            pre_hook = self.model.register_forward_pre_hook(pre_forward_hook)
-        
-        self.student_hooks.append(pre_hook)
-        
-        if not self.student_hooks:
-            LOGGER.warning(f"{log_prefix}沒有為學生模型註冊任何勾子！")
-        else:
-            LOGGER.info(f"{log_prefix}學生模型勾子註冊完成，共 {len(self.student_hooks)} 個勾子")
+            self.student_hooks.append(self.model.register_forward_pre_hook(pre_forward_hook))
 
     def _save_teacher_feature(self, layer_idx, feature):
         """Save features from the teacher model."""
@@ -635,42 +576,55 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         self.model.is_first_batch_in_epoch = False
         pass
         
-    def on_train_batch_start(self, trainer, batch, batch_idx):
-        """Callback triggered at the start of the batch process."""
-        # Get rank for distributed training
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
-        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+    def on_train_batch_start(self, trainer):
+        """在每個訓練批次開始時調用，確保特徵清理"""
+        # 清理特徵
+        self.teacher_features = {}
+        self.student_features = {}
         
-        # 只在第一批或每 10 個批次執行特徵收集和打印一次
-        if (trainer.epoch == 0 and batch_idx == 0) or (trainer.epoch % 10 == 0 and batch_idx % 10 == 0):
-            LOGGER.info(f"{log_prefix}當前教師模型勾子數: {len(self.teacher_hooks)}, 學生模型勾子數: {len(self.student_hooks)}")
-        
-        # 當模型是 DistributedDataParallel 時，獲取當前批次的索引
-        bi = batch_idx
-
-        # 確保有足夠的勾子
-        if self.teacher is not None and len(self.teacher_hooks) < len(self.target_layers):
-            self.register_teacher_hooks()
-        if len(self.student_hooks) < len(self.target_layers):
-            self.register_student_hooks()
-        
-        # 步驟 1: 收集模型特徵
-        batch = self.ensure_features_collection(batch)
-        
-        # 步驟 2: 計算蒸餾損失
+        # 重新檢查勾子
         if self.teacher is not None:
-            d_loss, batch = self.calculate_distillation_loss(batch)
+            # 獲取進程和設備信息
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
             
-            # Add distillation loss to the batch for total loss computation in model's loss method
-            if not torch.isnan(d_loss) and not torch.isinf(d_loss) and d_loss > 0:
-                batch['d_loss'] = d_loss.item()  # For logging
-                batch['d_loss_tensor'] = d_loss  # The actual tensor for loss computation
-            else:
-                batch['d_loss'] = 0.0  # For logging
-                batch['d_loss_tensor'] = torch.tensor(0.0, device=self.device)  # Dummy tensor
-        
-        return batch
+            # 每 10 批次檢查一次勾子是否正常
+            # 注意：在 DDP 模式下，trainer.batch 可能不是我們期望的值
+            ni = getattr(trainer, 'batch_idx', 0) if hasattr(trainer, 'batch_idx') else 0
+            
+            if (trainer.epoch == 0 and ni == 0) or (trainer.epoch % 10 == 0 and ni % 10 == 0):
+                # 檢查勾子數量
+                if not self.teacher_hooks or len(self.teacher_hooks) < len(self.target_layers):
+                    LOGGER.warning(f"{log_prefix}教師模型勾子數量不足或為空，重新註冊")
+                    self.register_teacher_hooks()
+                
+                if not self.student_hooks:
+                    LOGGER.warning(f"{log_prefix}學生模型勾子數量不足或為空，重新註冊")
+                    self.register_student_hooks()
+                    
+                # 檢查模型類型
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    LOGGER.info(f"{log_prefix}當前使用 DDP 模型")
+                    # 嘗試檢查模型結構
+                    try:
+                        model_layers = len(list(self.model.module.model))
+                        LOGGER.info(f"{log_prefix}學生模型層數: {model_layers}")
+                    except Exception as e:
+                        LOGGER.warning(f"{log_prefix}無法獲取學生模型層數: {str(e)}")
+                        
+                    for target in self.target_layers:
+                        if isinstance(target, int):
+                            try:
+                                layer = self.model.module.model[target]
+                                LOGGER.info(f"{log_prefix}成功找到學生模型層 {target}: {type(layer).__name__}")
+                            except (IndexError, AttributeError) as e:
+                                LOGGER.warning(f"{log_prefix}無法訪問學生模型層 {target}: {str(e)}")
+                                # 建議使用不同的目標層
+                                LOGGER.info(f"{log_prefix}建議使用模塊名稱而不是索引，或使用正確的索引範圍: 0-{model_layers-1 if 'model_layers' in locals() else 'unknown'}")
+                                
+                # 檢查特徵字典
+                LOGGER.info(f"{log_prefix}教師特徵: {bool(self.teacher_features)}, 學生特徵: {bool(self.student_features)}")
 
     def set_target_layers(self, new_target_layers):
         """
@@ -763,97 +717,3 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
     def plot_metrics(self):
         """Plots training/val metrics."""
         plot_results(file=self.csv, pose=True, on_plot=self.on_plot)  # save results.png
-
-    def calculate_distillation_loss(self, batch):
-        """Calculate distillation loss between teacher and student features."""
-        # Get rank for distributed training
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
-        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
-        
-        # Check if we have the necessary components
-        if (not self.teacher_features or not self.student_features) and self.teacher is not None:
-            LOGGER.warning(f"{log_prefix}沒有收集到特徵，無法計算蒸餾損失")
-            LOGGER.info(f"{log_prefix}教師特徵: {bool(self.teacher_features)}, 學生特徵: {bool(self.student_features)}")
-            
-            # Try to ensure features are collected again
-            batch = self.ensure_features_collection(batch)
-            
-            # Check again after collection attempt
-            if not self.teacher_features or not self.student_features:
-                missing_components = []
-                if not hasattr(batch, 'teacher') or batch['teacher'] is None:
-                    missing_components.append("teacher")
-                if not self.teacher_features:
-                    missing_components.append("teacher_features")
-                if not self.student_features:
-                    missing_components.append("student_features")
-                
-                LOGGER.warning(f"{log_prefix}缺少蒸餾所需的組件: {', '.join(missing_components)}")
-                return 0.0, batch
-        
-        d_loss = 0.0
-        
-        try:
-            # Loop through all features that should be matching
-            for layer_idx in self.target_layers:
-                # 確保層索引是字符串形式，以支持 DDP 環境
-                if isinstance(layer_idx, int):
-                    layer_idx = f"model.{layer_idx}"
-                
-                # 檢查是否有收集到相應層的特徵
-                if layer_idx not in self.teacher_features or layer_idx not in self.student_features:
-                    if layer_idx not in self.teacher_features:
-                        LOGGER.warning(f"{log_prefix}教師模型沒有層 {layer_idx} 的特徵")
-                    if layer_idx not in self.student_features:
-                        LOGGER.warning(f"{log_prefix}學生模型沒有層 {layer_idx} 的特徵")
-                    continue
-                
-                # Get features from teacher and student
-                t_feat = self.teacher_features[layer_idx]
-                s_feat = self.student_features[layer_idx]
-                
-                # Ensure they're on the same device
-                if t_feat.device != s_feat.device:
-                    LOGGER.info(f"{log_prefix}特徵設備不匹配: 教師({t_feat.device}) vs 學生({s_feat.device})，正在調整...")
-                    t_feat = t_feat.to(s_feat.device)
-                
-                # Ensure shapes match or can be adapted
-                if t_feat.shape != s_feat.shape:
-                    # 如果通道數不同，則使用自適應平均池化進行調整
-                    if t_feat.shape[1] != s_feat.shape[1]:  # 通道數不同
-                        LOGGER.info(
-                            f"{log_prefix}特徵通道數不匹配 (層 {layer_idx}): "
-                            f"教師({t_feat.shape[1]}) vs 學生({s_feat.shape[1]})，將使用 MSE 損失"
-                        )
-                    else:  # 空間維度不同
-                        # 將教師特徵調整為與學生特徵相同的空間尺寸
-                        if len(t_feat.shape) == 4:  # For 2D features
-                            t_feat = F.interpolate(t_feat, size=s_feat.shape[2:], mode='bilinear', align_corners=False)
-                            LOGGER.info(
-                                f"{log_prefix}調整教師特徵大小: {t_feat.shape[2:]} -> {s_feat.shape[2:]} (層 {layer_idx})"
-                            )
-                
-                # Calculate MSE loss between teacher and student features
-                mse_loss = F.mse_loss(s_feat, t_feat)
-                d_loss += mse_loss
-                
-                # Log the individual loss components
-                LOGGER.debug(f"{log_prefix}層 {layer_idx} 的蒸餾損失: {mse_loss.item():.6f}")
-            
-            # Apply distillation weight
-            d_loss *= self.distill
-            
-            # Add to batch for later processing
-            batch['d_loss'] = d_loss.item()
-            
-            LOGGER.info(f"{log_prefix}總蒸餾損失 (d_loss): {d_loss.item():.6f}")
-            
-        except Exception as e:
-            LOGGER.error(f"{log_prefix}計算蒸餾損失時發生錯誤: {str(e)}")
-            import traceback
-            LOGGER.error(traceback.format_exc())
-            d_loss = 0.0
-            batch['d_loss'] = 0.0
-        
-        return d_loss, batch
