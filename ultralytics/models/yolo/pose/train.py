@@ -304,6 +304,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             except Exception as e:
                 LOGGER.error(f"{log_prefix}{batch_info} - 前向傳播測試時出錯: {str(e)}")
             
+            # 保存測試特徵用於後續使用
+            test_teacher_features = self.teacher_features.copy() if self.teacher_features else {}
+            test_student_features = self.student_features.copy() if self.student_features else {}
+            
             # 清除測試特徵，準備實際批次處理
             self.teacher_features = {}
             self.student_features = {}
@@ -312,6 +316,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             batch["teacher"] = self.teacher
             batch["teacher_features"] = self.teacher_features
             batch["student_features"] = self.student_features
+            
+            # 添加原始特徵作為備份
+            batch["raw_teacher_features"] = test_teacher_features
+            batch["raw_student_features"] = test_student_features
             
             # 在實際輸入上執行教師模型前向傳播，確保特徵被收集
             try:
@@ -328,8 +336,19 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                             for key in list(self.teacher_features.keys())[:1]:
                                 feat = self.teacher_features[key]
                                 LOGGER.info(f"{log_prefix}{batch_info} - 特徵[{key}]形狀: {feat.shape}, 設備: {feat.device}")
+                        
+                        # 更新原始特徵字典，確保有值
+                        if self.teacher_features and not batch["raw_teacher_features"]:
+                            batch["raw_teacher_features"] = self.teacher_features.copy()
+                            LOGGER.info(f"{log_prefix}{batch_info} - 更新raw_teacher_features，現有 {len(batch['raw_teacher_features'])} 個特徵")
             except Exception as e:
                 LOGGER.error(f"{log_prefix}{batch_info} - 對實際批次執行前向傳播時出錯: {str(e)}")
+                # 如果新前向傳播失敗，用測試特徵替代
+                if test_teacher_features and not self.teacher_features:
+                    LOGGER.info(f"{log_prefix}{batch_info} - 使用測試特徵替代失敗的前向傳播結果")
+                    self.teacher_features = test_teacher_features
+                    batch["teacher_features"] = self.teacher_features
+                    batch["raw_teacher_features"] = test_teacher_features
             
         return batch
             

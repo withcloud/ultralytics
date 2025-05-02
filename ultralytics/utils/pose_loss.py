@@ -62,245 +62,142 @@ class v8PoseLoss(v8DetectionLoss):
         self.batch_counter = 0
         self.log_interval = 10  # Log every 10 batches
 
-    def __call__(self, preds, batch, teacher=None, distill_factor=None):
-        """Calculate the total loss and detach it for pose estimation."""
-        # Get rank for distributed training (for logging)
+    def __call__(self, preds, batch, teacher=None, distill_factor=0.0, batch_idx=None):
+        """Calculate the loss for YOLO predictions and targets."""
+        # Initialize loss components (box, cls, dfl)
+        loss = torch.zeros(3, device=self.device)
+        
+        # Extract features from preds
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        preds = preds[0] if isinstance(preds, tuple) else preds
+
+        # Extract batch information
+        if batch_idx is None and 'batch_idx' in batch:
+            batch_idx = batch['batch_idx']
+        
+        # Log info about the batch being processed
         rank = dist.get_rank() if dist.is_initialized() else 0
-        gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
         log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
         
-        # Increment batch counter
-        self.batch_counter += 1
-        
-        # 獲取設備
-        input_device = batch["img"].device
-        
-        # 用於日誌的批次信息
-        batch_idx = batch.get("batch_idx", None)
         if batch_idx is not None:
-            log_batch = f"batch {batch_idx.min().item() if isinstance(batch_idx, torch.Tensor) else batch_idx}"
+            batch_info = f"批次 {batch_idx.min().item() if isinstance(batch_idx, torch.Tensor) else batch_idx}"
         else:
-            log_batch = "current batch"
-            
-        LOGGER.info(f"{log_prefix}{log_batch} - 處理損失計算 - 特徵收集狀態: 教師特徵={len(batch.get('teacher_features', {}))}, 學生特徵={len(batch.get('student_features', {}))}")
+            batch_info = "未知批次"
         
-        loss = torch.zeros(6, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility, distill
-        feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
-
-        # B, grids, ..
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-        pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
-
-        dtype = pred_scores.dtype
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-
-        # Targets
-        batch_size = pred_scores.shape[0]
-        batch_idx = batch["batch_idx"].view(-1, 1)
-        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
-
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        pred_kpts = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))  # (b, h*w, 17, 3)
-
-        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt,
-        )
-
-        target_scores_sum = max(target_scores.sum(), 1)
-
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
-        # Bbox loss
-        if fg_mask.sum():
-            target_bboxes /= stride_tensor
-            loss[0], loss[4] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
-            )
-            keypoints = batch["keypoints"].to(self.device).float().clone()
-            keypoints[..., 0] *= imgsz[1]
-            keypoints[..., 1] *= imgsz[0]
-
-            loss[1], loss[2] = self.calculate_keypoints_loss(
-                fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
-            )
-
-        # 特徵蒸餾損失計算
-        should_log = self.batch_counter % self.log_interval == 0  # Only log every log_interval batches
-        d_loss = torch.tensor(0.0, device=self.device, requires_grad=True)  # 初始化蒸餾損失
+        LOGGER.info(f"{log_prefix}{batch_info} - 開始計算loss")
         
-        # 檢查是否有教師模型、特徵和蒸餾係數
-        if teacher is not None and distill_factor is not None and distill_factor > 0:
-            teacher_features = batch.get("teacher_features", {})
-            student_features = batch.get("student_features", {})
+        # Check features collection status
+        teacher_features_count = 0
+        student_features_count = 0
+        
+        # Extract features from batch if available
+        batch_teacher_features = batch.get("teacher_features", {})
+        batch_student_features = batch.get("student_features", {})
+        
+        # 從批次中獲取原始特徵作為備份
+        raw_teacher_features = batch.get("raw_teacher_features", {})
+        raw_student_features = batch.get("raw_student_features", {})
+        
+        # Log debug information about features
+        LOGGER.info(f"{log_prefix}{batch_info} - 批次中教師特徵: {len(batch_teacher_features)}個, 學生特徵: {len(batch_student_features)}個")
+        LOGGER.info(f"{log_prefix}{batch_info} - 原始教師特徵: {len(raw_teacher_features)}個, 原始學生特徵: {len(raw_student_features)}個")
+        
+        # Calculate the keypoints loss
+        keypoints_loss, keypoint_obj_loss = self.calculate_keypoints_loss(preds, batch)
+        
+        # Calculate object loss
+        object_loss = self.calculate_object_loss(preds, batch)
+        
+        # Add keypoints loss and object loss to total loss
+        loss[0] = keypoints_loss
+        loss[1] = object_loss
+        loss[2] = keypoint_obj_loss
+        
+        # Calculate distillation loss if teacher is provided and distill_factor > 0
+        distill_loss = torch.tensor(0.0, device=self.device)
+        if teacher is not None and distill_factor > 0:
+            LOGGER.info(f"{log_prefix}{batch_info} - 計算蒸餾loss, 因子: {distill_factor}")
             
-            if teacher_features:
-                # 檢查教師特徵內容
-                LOGGER.info(f"{log_prefix}{log_batch} - 教師特徵鍵: {list(teacher_features.keys())}")
-                for k in list(teacher_features.keys())[:2]:  # 只顯示前兩個，避免日誌過長
-                    feat = teacher_features[k]
-                    if isinstance(feat, torch.Tensor):
-                        LOGGER.info(f"{log_prefix}{log_batch} - 教師特徵[{k}] 形狀: {feat.shape}, 設備: {feat.device}")
-                
-            if student_features:
-                # 檢查學生特徵內容
-                LOGGER.info(f"{log_prefix}{log_batch} - 學生特徵鍵: {list(student_features.keys())}")
-                for k in list(student_features.keys())[:2]:  # 只顯示前兩個，避免日誌過長
-                    feat = student_features[k]
-                    if isinstance(feat, torch.Tensor):
-                        LOGGER.info(f"{log_prefix}{log_batch} - 學生特徵[{k}] 形狀: {feat.shape}, 設備: {feat.device}")
-            
-            if should_log:
-                LOGGER.info(f"{log_prefix}{log_batch} - 將使用教師模型進行蒸餾，係數={distill_factor}")
-                LOGGER.info(f"{log_prefix}{log_batch} - 教師特徵數量: {len(teacher_features)}, 學生特徵數量: {len(student_features)}")
-            
-            # 使用 compute_distill_loss 計算特徵蒸餾損失
-            if hasattr(self, 'compute_distill_loss'):
-                d_loss = self.compute_distill_loss(student_features, teacher_features, batch_idx)
-                
-                # 將蒸餾損失添加到總損失中
-                if d_loss.numel() > 0:
-                    d_loss_value = d_loss.item()
-                    loss[5] = d_loss
-                    if should_log:
-                        LOGGER.info(f"{log_prefix}{log_batch} - 特徵蒸餾損失: {d_loss_value:.5f}")
-                else:
-                    if should_log:
-                        LOGGER.warning(f"{log_prefix}{log_batch} - 特徵蒸餾損失為零或無效")
+            # Check if teacher_features are collected
+            if hasattr(teacher, 'teacher_features'):
+                teacher_features = teacher.teacher_features
+                teacher_features_count = len(teacher_features)
+                LOGGER.info(f"{log_prefix}{batch_info} - 教師特徵數量: {teacher_features_count}")
             else:
-                # 如果沒有 compute_distill_loss 方法，使用之前的方式計算蒸餾損失
-                if should_log:
-                    LOGGER.warning(f"{log_prefix}{log_batch} - 未找到 compute_distill_loss 方法，使用舊的方式計算蒸餾損失")
-                
-                # 這裡實現之前的特徵蒸餾邏輯
-                if teacher_features and student_features:
-                    # Find common keys between teacher and student features
-                    common_keys = set(teacher_features.keys()) & set(student_features.keys())
-                    
-                    # Separate into integer and string keys
-                    int_keys = sorted([k for k in common_keys if isinstance(k, int)])
-                    str_keys = sorted([k for k in common_keys if isinstance(k, str)])
-                    
-                    # Combine sorted keys
-                    target_layers = int_keys + str_keys
-                    
-                    if target_layers:
-                        if should_log:
-                            LOGGER.info(f"{log_prefix}{log_batch} - 計算蒸餾損失，目標層數: {len(target_layers)}")
-                        
-                        # Calculate distillation loss for each layer
-                        distill_losses = []
-                        for layer_idx in target_layers:
-                            t_feat = teacher_features[layer_idx]
-                            s_feat = student_features[layer_idx]
-                            
-                            # 檢查是否為 None
-                            if t_feat is None or s_feat is None:
-                                continue
-                            
-                            # 確保特徵在同一設備上
-                            current_device = s_feat.device
-                            if t_feat.device != current_device:
-                                t_feat = t_feat.to(current_device)
-                            
-                            # 確保特徵已分離，不會影響教師模型的梯度
-                            t_feat = t_feat.detach()
-                            
-                            # Ensure feature shapes match
-                            if t_feat.shape != s_feat.shape:
-                                # 嘗試調整形狀以匹配
-                                try:
-                                    if len(t_feat.shape) == len(s_feat.shape):
-                                        # 找出每個維度的最小值
-                                        min_dims = [min(td, sd) for td, sd in zip(t_feat.shape, s_feat.shape)]
-                                        # 裁剪兩個特徵到相同大小
-                                        if len(min_dims) == 4:  # 典型的卷積特徵 [batch, channels, height, width]
-                                            t_feat = t_feat[:min_dims[0], :min_dims[1], :min_dims[2], :min_dims[3]]
-                                            s_feat = s_feat[:min_dims[0], :min_dims[1], :min_dims[2], :min_dims[3]]
-                                        else:
-                                            # 其他情況，繼續嘗試下一層
-                                            continue
-                                    else:
-                                        # 維度數不同，跳過此層
-                                        continue
-                                except Exception as e:
-                                    if should_log:
-                                        LOGGER.warning(f"{log_prefix}{log_batch} - 調整特徵形狀時出錯: {str(e)}")
-                                    continue
-                            
-                            # 計算 MSE 損失
-                            try:
-                                layer_loss = self.mse_loss(s_feat, t_feat)
-                                # 檢查損失是否為 NaN 或無限大
-                                if torch.isnan(layer_loss) or torch.isinf(layer_loss):
-                                    continue
-                                    
-                                distill_losses.append(layer_loss)
-                                
-                                if should_log:
-                                    LOGGER.info(f"{log_prefix}{log_batch} - 層 {layer_idx} 的蒸餾損失: {layer_loss.item():.5f}")
-                            except Exception as e:
-                                if should_log:
-                                    LOGGER.warning(f"{log_prefix}{log_batch} - 計算層 {layer_idx} 的蒸餾損失時出錯: {str(e)}")
-                                continue
-                        
-                        if distill_losses:
-                            # Combine all layer losses
-                            loss[5] = torch.sum(torch.stack(distill_losses))
-                            
-                            if should_log:
-                                LOGGER.info(f"{log_prefix}{log_batch} - 總蒸餾損失 (未加權): {loss[5].item():.5f}")
-                        else:
-                            if should_log:
-                                LOGGER.warning(f"{log_prefix}{log_batch} - 沒有計算出有效的蒸餾損失")
-                    else:
-                        if should_log:
-                            LOGGER.warning(f"{log_prefix}{log_batch} - 教師和學生模型沒有共同的特徵層，無法計算蒸餾損失")
-                else:
-                    if should_log:
-                        LOGGER.warning(f"{log_prefix}{log_batch} - 無法計算蒸餾損失，特徵字典為空")
-        else:
-            # 如果沒有教師模型或蒸餾係數，將蒸餾損失設為零
-            if should_log and teacher is None:
-                LOGGER.info(f"{log_prefix}{log_batch} - 沒有教師模型，不計算蒸餾損失")
-            elif should_log and distill_factor is None:
-                LOGGER.info(f"{log_prefix}{log_batch} - 沒有指定蒸餾係數，不計算蒸餾損失")
-            elif should_log and distill_factor <= 0:
-                LOGGER.info(f"{log_prefix}{log_batch} - 蒸餾係數 <= 0，不計算蒸餾損失")
-
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.pose  # pose gain
-        loss[2] *= self.hyp.kobj  # kobj gain
-        loss[3] *= self.hyp.cls  # cls gain
-        loss[4] *= self.hyp.dfl  # dfl gain
-        loss[5] *= self.hyp.distill if hasattr(self.hyp, 'distill') else 1.0  # distill gain
-        
-        if should_log:
-            # Log all weighted loss components
-            LOGGER.info(
-                f"{log_prefix}Loss components: box={loss[0]:.4f}, pose={loss[1]:.4f}, "
-                f"kobj={loss[2]:.4f}, cls={loss[3]:.4f}, dfl={loss[4]:.4f}, distill={loss[5]:.4f}"
-            )
+                teacher_features = {}
+                LOGGER.warning(f"{log_prefix}{batch_info} - 教師模型沒有teacher_features屬性")
             
-        # 摘要輸出損失值用於調試
-        LOGGER.info(f"{log_prefix}{log_batch} - 總損失: {loss.sum():.4f}, 蒸餾損失: {loss[5]:.4f}")
-
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+            # Try using features from batch if teacher_features is empty
+            if not teacher_features and batch_teacher_features:
+                LOGGER.info(f"{log_prefix}{batch_info} - 使用來自batch的教師特徵")
+                teacher_features = batch_teacher_features
+                teacher_features_count = len(teacher_features)
+            
+            # 如果仍未獲得教師特徵，嘗試使用原始特徵備份
+            if not teacher_features and raw_teacher_features:
+                LOGGER.info(f"{log_prefix}{batch_info} - 使用原始教師特徵備份")
+                teacher_features = raw_teacher_features
+                teacher_features_count = len(teacher_features)
+            
+            # Check if student_features are collected
+            if hasattr(self, 'student_features'):
+                student_features = self.student_features
+                student_features_count = len(student_features)
+                LOGGER.info(f"{log_prefix}{batch_info} - 學生特徵數量: {student_features_count}")
+            else:
+                student_features = {}
+                LOGGER.warning(f"{log_prefix}{batch_info} - loss類沒有student_features屬性")
+            
+            # Try using features from batch if student_features is empty
+            if not student_features and batch_student_features:
+                LOGGER.info(f"{log_prefix}{batch_info} - 使用來自batch的學生特徵")
+                student_features = batch_student_features
+                student_features_count = len(student_features)
+            
+            # 如果仍未獲得學生特徵，嘗試使用原始特徵備份
+            if not student_features and raw_student_features:
+                LOGGER.info(f"{log_prefix}{batch_info} - 使用原始學生特徵備份")
+                student_features = raw_student_features
+                student_features_count = len(student_features)
+            
+            # Log feature keys for debugging
+            if teacher_features:
+                LOGGER.info(f"{log_prefix}{batch_info} - 教師特徵鍵: {list(teacher_features.keys())}")
+            if student_features:
+                LOGGER.info(f"{log_prefix}{batch_info} - 學生特徵鍵: {list(student_features.keys())}")
+            
+            # If both teacher and student features are collected, compute distillation loss
+            if teacher_features_count > 0 and student_features_count > 0:
+                try:
+                    distill_loss = self.compute_distill_loss(teacher_features, student_features) * distill_factor
+                    LOGGER.info(f"{log_prefix}{batch_info} - 蒸餾loss計算成功: {distill_loss.item()}")
+                except Exception as e:
+                    LOGGER.error(f"{log_prefix}{batch_info} - 計算蒸餾loss時出錯: {str(e)}")
+                    distill_loss = torch.tensor(0.0, device=self.device)
+            else:
+                LOGGER.warning(f"{log_prefix}{batch_info} - 無法計算蒸餾loss: 教師特徵={teacher_features_count}, 學生特徵={student_features_count}")
+        
+        # Add distillation loss to total loss (if valid)
+        if distill_loss.item() != 0.0:
+            LOGGER.info(f"{log_prefix}{batch_info} - 添加蒸餾loss到總loss: {distill_loss.item()}")
+            # We can add it to any loss component, as it will be weighted by the loss weights later
+            loss[2] += distill_loss
+        
+        # Log final loss components
+        LOGGER.info(
+            f"{log_prefix}{batch_info} - Loss組成: "
+            f"keypoints_loss={loss[0].item():.4f}, "
+            f"object_loss={loss[1].item():.4f}, "
+            f"keypoint_obj_loss={loss[2].item():.4f}, "
+            f"distill_loss={distill_loss.item():.4f}"
+        )
+        
+        # Calculate batch size (number of images in batch)
+        batch_size = preds.shape[0]
+        
+        # Return the loss
+        return loss.sum() * batch_size, loss.detach()
 
     @staticmethod
     def kpts_decode(anchor_points, pred_kpts):
