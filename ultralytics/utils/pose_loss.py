@@ -162,6 +162,11 @@ class v8PoseLoss(v8DetectionLoss):
                         t_feat = teacher_features[layer_idx].detach()  # Ensure we don't backprop through teacher
                         s_feat = student_features[layer_idx]
                         
+                        # 確保特徵在同一設備上
+                        current_device = s_feat.device
+                        if t_feat.device != current_device:
+                            t_feat = t_feat.to(current_device)
+                        
                         # Ensure feature shapes match
                         if t_feat.shape != s_feat.shape:
                             if should_log:
