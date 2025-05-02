@@ -69,15 +69,27 @@ class v8PoseLoss(v8DetectionLoss):
     def __call__(self, preds, batch):
         """Calculate the total loss and detach it for pose estimation."""
 
-        # 推理之前，要註冊勾子
-        # 檢查是否訓
-        
+        self.teacher_features = {}
+        self.student_features = {}
 
+        if "teacher" in batch and batch["teacher"] is not None:
+            self.teacher = batch["teacher"].to(self.device)
+            self.target_layers = batch["target_layers"]
+
+        # 推理之前，要註冊勾子
+        # 檢查是否 train_start 為 True
+        if "teacher" in batch and batch["teacher"] is not None:
+            if hasattr(self.model, "train_start") and self.model.train_start:
+                # 註冊勾子
+                print(f"\n\n註冊勾子!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                self.register_teacher_hooks()
+                # self.register_student_hooks()
+                self.model.train_start = False
+        
         # 教師模型推理
         if "teacher" in batch and batch["teacher"] is not None:
-            teacher = batch["teacher"].to(self.device)
             with torch.no_grad():
-                teacher_preds = teacher(batch["img"])
+                teacher_preds = self.teacher(batch["img"])
 
         # 學生模型推理
         preds = self.model.forward(batch["img"])
@@ -197,6 +209,87 @@ class v8PoseLoss(v8DetectionLoss):
         loss[5] *= self.hyp.distill  # distill gain
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+    
+    def register_teacher_hooks(self):
+        """Register hooks on the teacher model to capture intermediate features."""
+        if self.teacher is not None:
+            # Clear any existing hooks
+            for hook in self.teacher_hooks:
+                hook.remove()
+            self.teacher_hooks = []
+            
+            # Get rank for distributed training
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+            
+            print(f"{log_prefix}Registering hooks for teacher model:")
+            
+            # 建立模塊名稱到模塊的映射
+            module_dict = {}
+            for name, module in self.teacher.named_modules():
+                module_dict[name] = module
+                
+            # 處理每個目標層
+            for target in self.target_layers:
+                if isinstance(target, int):
+                    # 如果是整數索引，直接獲取對應層
+                    layer = self.teacher.model[target]
+                    layer_full_name = f"model.{target}"
+                    layer_idx = target  # 用於hook的layer_idx
+                else:
+                    # 如果是字符串路徑，從module_dict中查找
+                    if target in module_dict:
+                        layer = module_dict[target]
+                        layer_full_name = target
+                        # 對於字符串路徑，我們使用一個唯一標識作為layer_idx
+                        layer_idx = target
+                    else:
+                        print(f"{log_prefix}在教師模型中未找到指定層: {target}")
+                        continue
+                
+                # 獲取層的類型
+                layer_type = layer.__class__.__name__
+                
+                # 構建詳細的層信息
+                layer_info = f"層名稱: {layer_full_name}, 類型: {layer_type}"
+                
+                # 直接檢查該層是否有conv屬性
+                if hasattr(layer, 'conv'):
+                    layer_info += f", 通道數: {layer.conv.out_channels}"
+                else:
+                    # 動態查找所有子模塊中的conv
+                    conv_modules = []
+                    # 獲取層的所有模塊
+                    for name, module in layer.named_modules():
+                        if hasattr(module, 'conv') and name != '':  # 排除模塊本身
+                            if layer_full_name == "model":  # 處理特殊情況
+                                full_path = f"{layer_full_name}.{name}.conv"
+                            else:
+                                full_path = f"{layer_full_name}.{name}.conv" if name else f"{layer_full_name}.conv"
+                            conv_info = f"{full_path}: {module.conv.out_channels}通道"
+                            conv_modules.append(conv_info)
+                    
+                    if conv_modules:
+                        layer_info += f"\n  子模塊包含:"
+                        # 顯示所有conv模塊，但限制數量避免輸出過多
+                        max_show = min(len(conv_modules), 5)
+                        for j in range(max_show):
+                            layer_info += f"\n    - {conv_modules[j]}"
+                        if len(conv_modules) > max_show:
+                            layer_info += f"\n    ... 等{len(conv_modules)}個conv模塊"
+                
+                print(f"{log_prefix}{layer_info}")
+                
+                # 註冊勾子，使用自定義的_save_feature方法並傳遞layer_idx
+                self.teacher_hooks.append(layer.register_forward_hook(
+                    lambda module, input, output, idx=layer_idx: self._save_teacher_feature(idx, output)))
+            
+            print(f"{log_prefix}教師模型勾子註冊完成，共 {len(self.teacher_hooks)} 個勾子")
+
+    def _save_teacher_feature(self, layer_idx, feature):
+        """Save features from the teacher model."""
+        self.teacher_features[layer_idx] = feature
 
     @staticmethod
     def kpts_decode(anchor_points, pred_kpts):
