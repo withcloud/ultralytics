@@ -30,7 +30,7 @@ def main():
     results = model.train(
         # 基本訓練設置
         data="coco-pose.yaml",
-        epochs=120,             # 初步實驗用20個epoch
+        epochs=180,             # 初步實驗用20個epoch
         imgsz=640,
         batch=144,
         device=[0, 1, 2, 3],
@@ -38,9 +38,9 @@ def main():
         
         # 蒸餾參數
         teacher="yolo11n-pose.pt",
-        target_layers=["model.0.conv", "model.1.conv"],
+        target_layers=["model.0.conv", "model.1.conv", "model.2.cv1.conv", "model.2.cv2.conv", "model.3.conv", "model.4.cv1.conv", "model.4.cv2.conv", "model.5.conv", "model.6.cv1.conv", "model.6.cv2.conv", "model.7.conv"],
         distill=0.8,           # 較高蒸餾權重
-        freezeAllBN=True,
+        freezeAllBN=False,
 
         # box=0.00001, # (float) box loss gain
         # cls=0.00001, # (float) cls loss gain (scale with pixels)
