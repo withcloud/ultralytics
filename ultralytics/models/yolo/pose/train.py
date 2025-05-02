@@ -82,7 +82,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             _callbacks["on_val_end"].append(self.on_val_end)
             _callbacks["on_train_end"].append(self.on_train_end)
             _callbacks["teardown"].append(self.teardown)
-            _callbacks["on_batch_end"].append(self.on_batch_end)
+            _callbacks["on_train_batch_end"].append(self.on_train_batch_end)
 
         # Initialize parent class first to set up device and other attributes
         super().__init__(cfg, overrides, _callbacks)
@@ -222,7 +222,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
     def teardown(self, trainer):
         pass
     
-    def on_batch_end(self, trainer):
+    def on_train_batch_end(self, trainer):
         self.batch_is_first_batch_in_epoch = False
         self.batch_train_start = False
 
