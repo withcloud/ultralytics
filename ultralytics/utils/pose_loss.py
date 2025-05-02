@@ -61,9 +61,19 @@ class v8PoseLoss(v8DetectionLoss):
         # Initialize batch counter for logging control
         self.batch_counter = 0
         self.log_interval = 10  # Log every 10 batches
+        self.model = model
 
     def __call__(self, preds, batch):
         """Calculate the total loss and detach it for pose estimation."""
+
+        if "teacher" in batch and batch["teacher"] is not None:
+            teacher = batch["teacher"]
+            with torch.no_grad():
+                teacher_preds = teacher(batch["img"])
+
+        preds = self.model.forward(batch["img"])
+
+        
         # Get rank for distributed training (for logging)
         rank = dist.get_rank() if dist.is_initialized() else 0
         gpu_id = self.device.index if hasattr(self.device, 'index') else 0

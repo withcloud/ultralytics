@@ -337,9 +337,9 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         if self.teacher is not None:
             batch["teacher"] = self.teacher
                 
-            # Store features in the batch
-            batch["teacher_features"] = self.teacher_features
-            batch["student_features"] = self.student_features
+            # # Store features in the batch
+            # batch["teacher_features"] = self.teacher_features
+            # batch["student_features"] = self.student_features
 
         return batch
 
@@ -373,10 +373,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                     LOGGER.info(f"{log_prefix}  - {name}: {module_type} (參數量: {num_params}){channels_info}")
             LOGGER.info(f"{log_prefix}" + "=" * 80)
 
-            # Register hooks for the teacher model
-            self.register_teacher_hooks()
-            # Register hooks for the student model
-            self.register_student_hooks()
+            # # Register hooks for the teacher model
+            # self.register_teacher_hooks()
+            # # Register hooks for the student model
+            # self.register_student_hooks()
 
     def on_epoch_start(self, trainer):
         # Get rank for distributed training
