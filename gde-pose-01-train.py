@@ -32,7 +32,7 @@ def main():
         data="coco-pose.yaml",
         epochs=20,             # 初步實驗用20個epoch
         imgsz=640,
-        batch=128,             # 4個4090的大批量
+        batch=126,             # 4個4090的大批量
         device=[0, 1, 2, 3, 4, 5],
         workers=16,
         
