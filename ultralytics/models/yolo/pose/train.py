@@ -96,6 +96,11 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 "See https://github.com/ultralytics/ultralytics/issues/4031."
             )
 
+        self.batch_train_start = False
+        self.batch_epoch = 0
+        self.batch_epochs = 0
+        self.batch_is_first_batch_in_epoch = False
+
     def init_teacher_model(self):
         """Initialize the teacher model on the current device."""
         if self.teacher_path is not None and self.teacher is None:
@@ -157,6 +162,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         if self.teacher is not None:
             batch["teacher"] = self.teacher
             batch["target_layers"] = self.target_layers
+            batch["train_start"] = self.batch_train_start
+            batch["epoch"] = self.batch_epoch
+            batch["epochs"] = self.batch_epochs
+            batch["is_first_batch_in_epoch"] = self.batch_is_first_batch_in_epoch
 
         return batch
 
@@ -168,7 +177,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         
         print(f"{log_prefix}Starting training...")
         
-        self.model.train_start = True
+        self.batch_train_start = True
         
         if self.teacher is not None:
             # 打印教師模型和學生模型的結構
@@ -193,9 +202,9 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             print(f"{log_prefix}" + "=" * 80)
 
     def on_epoch_start(self, trainer):        
-        self.model.epoch = trainer.epoch
-        self.model.epochs = trainer.epochs
-        self.model.is_first_batch_in_epoch = True
+        self.batch_epoch = trainer.epoch
+        self.batch_epochs = trainer.epochs
+        self.batch_is_first_batch_in_epoch = True
 
     def on_epoch_end(self, trainer):
         pass
@@ -207,13 +216,14 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         pass
     
     def on_train_end(self, trainer):
-        self.model.train_end = True
+        pass
         
     def teardown(self, trainer):
         pass
     
     def on_batch_end(self, trainer):
-        self.model.is_first_batch_in_epoch = False
+        self.batch_is_first_batch_in_epoch = False
+        self.batch_train_start = False
         pass
 
     def get_model(self, cfg=None, weights=None, verbose=True):

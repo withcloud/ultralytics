@@ -79,29 +79,22 @@ class v8PoseLoss(v8DetectionLoss):
         # 推理之前，要註冊勾子
         # 檢查是否 train_start 為 True
         if "teacher" in batch and batch["teacher"] is not None:
-            # 輸出 self.model 的屬性
-            print(f"\nModel attributes:")
-            for attr in dir(self.model):
-                if not attr.startswith('_'):
-                    print(f"  {attr}: {getattr(self.model, attr)}")
-
-            # 輸出 batch 的 keys
-            print(f"\nBatch keys: {list(batch.keys())}")
+            # # 輸出 batch 的 keys
+            # print(f"\nBatch keys: {list(batch.keys())}")
             
-            # 如果需要更詳細的信息，可以輸出每個 key 的數據類型和形狀
-            for key in batch.keys():
-                if isinstance(batch[key], torch.Tensor):
-                    print(f"  {key}: {type(batch[key]).__name__}, shape={batch[key].shape}, dtype={batch[key].dtype}")
-                elif batch[key] is None:
-                    print(f"  {key}: None")
-                else:
-                    print(f"  {key}: {type(batch[key]).__name__}")
-            if hasattr(self.model, "train_start") and self.model.train_start:
+            # # 如果需要更詳細的信息，可以輸出每個 key 的數據類型和形狀
+            # for key in batch.keys():
+            #     if isinstance(batch[key], torch.Tensor):
+            #         print(f"  {key}: {type(batch[key]).__name__}, shape={batch[key].shape}, dtype={batch[key].dtype}")
+            #     elif batch[key] is None:
+            #         print(f"  {key}: None")
+            #     else:
+            #         print(f"  {key}: {type(batch[key]).__name__}")
+            if batch["batch_train_start"]:
                 # 註冊勾子
                 print(f"\n\n註冊勾子!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                 self.register_teacher_hooks()
                 # self.register_student_hooks()
-                self.model.train_start = False
                 exit()
         
         # 教師模型推理
