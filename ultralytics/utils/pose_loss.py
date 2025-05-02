@@ -214,6 +214,9 @@ class v8PoseLoss(v8DetectionLoss):
                 f"kobj={loss[2]:.4f}, cls={loss[3]:.4f}, dfl={loss[4]:.4f}, distill={loss[5]:.4f}"
             )
 
+            if rank == 1:
+                raise Exception("test")
+
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
     @staticmethod
