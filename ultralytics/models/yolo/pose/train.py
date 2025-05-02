@@ -116,7 +116,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             # Load teacher model using attempt_load_weights to avoid circular imports
             try:                
                 # Load the model using attempt_load_weights instead of YOLO
-                self.teacher = attempt_load_weights(self.teacher_path, device=self.device, inplace=True, fuse=True)
+                self.teacher = attempt_load_weights(self.teacher_path, device=self.device, inplace=True, fuse=False)
                 
                 # Freeze teacher parameters
                 for k, v in self.teacher.named_parameters():
@@ -187,7 +187,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             for name, module in self.teacher.named_modules():
                 if name.startswith("model.") and len(name.split(".")) <= 3:
                     module_type = module.__class__.__name__
-                    num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+                    num_params = sum(p.numel() for p in module.parameters())
                     has_conv = hasattr(module, 'conv')
                     channels_info = f", 通道數: {module.conv.out_channels}" if has_conv else ""
                     print(f"{log_prefix}  - {name}: {module_type} (參數量: {num_params}){channels_info}")
@@ -196,7 +196,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             for name, module in self.model.named_modules():
                 if name.startswith("model.") and len(name.split(".")) <= 3:
                     module_type = module.__class__.__name__
-                    num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+                    num_params = sum(p.numel() for p in module.parameters())
                     has_conv = hasattr(module, 'conv')
                     channels_info = f", 通道數: {module.conv.out_channels}" if has_conv else ""
                     print(f"{log_prefix}  - {name}: {module_type} (參數量: {num_params}){channels_info}")
