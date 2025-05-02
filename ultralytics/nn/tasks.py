@@ -517,58 +517,93 @@ class PoseModel(DetectionModel):
             cfg["kpt_shape"] = data_kpt_shape
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
-    def loss(self, batch, feature_distill=False):
-        """Calculate pose losses with optional feature distillation."""
-        if not hasattr(self, 'compute_loss'):
-            self.compute_loss = v8PoseLoss(self)
+    def loss(self, batch):
+        """
+        Calculate pose loss for a batch.
         
-        # 從批次中提取蒸餾相關信息
-        teacher = batch.get("teacher", None)
-        teacher_features = batch.get("teacher_features", {})
-        student_features = batch.get("student_features", {})
-        distill_factor = getattr(self, 'distill', 1.0) if teacher is not None else None
-        
-        # Get rank for distributed training
+        Args:
+            batch (dict): A dict containing:
+                img (torch.Tensor): Images to be processed.
+                batch_idx (torch.Tensor): Batch indices.
+                keypoints (torch.Tensor): Ground truth keypoints.
+                bboxes (torch.Tensor, optional): Ground truth bounding boxes.
+                cls (torch.Tensor, optional): Ground truth class indices.
+                
+        Returns:
+            (torch.Tensor): Total loss, sum of classification, bbox, and auxiliary losses.
+        """
+        # Get the device and log information
+        device = self.device.index if hasattr(self.device, 'index') else self.device
         rank = dist.get_rank() if dist.is_initialized() else 0
-        gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else -1
-        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        log_prefix = f"[Rank {rank}, GPU {device}] "
         
-        # 用於日誌的批次信息
+        # Extract batch info for logging
         batch_idx = batch.get("batch_idx", None)
-        if batch_idx is not None:
-            batch_info = f"批次 {batch_idx.min().item() if isinstance(batch_idx, torch.Tensor) else batch_idx}"
-        else:
-            batch_info = "未知批次"
+        batch_info = f"批次 {batch_idx.min().item() if batch_idx is not None and isinstance(batch_idx, torch.Tensor) else 'unknown'}"
+        
+        # Initialize compute_loss if not already created
+        if not hasattr(self, 'compute_loss'):
+            self.compute_loss = v8PoseLoss(de_parallel(self.model).model[-1], use_dfl=self.args.use_dfl)
             
-        # 檢查並記錄特徵收集情況
-        has_teacher = teacher is not None
-        teacher_features_count = len(teacher_features) if teacher_features else 0
-        student_features_count = len(student_features) if student_features else 0
+            # Initialize keypoint_weight and obj_weight
+            if not hasattr(self.compute_loss, 'keypoint_weight'):
+                self.compute_loss.keypoint_weight = 1.0
+            if not hasattr(self.compute_loss, 'obj_weight'):
+                self.compute_loss.obj_weight = 1.0
+            
+            LOGGER.info(f"{log_prefix}{batch_info} - 初始化 v8PoseLoss, 關節點權重={self.compute_loss.keypoint_weight}, 目標檢測權重={self.compute_loss.obj_weight}")
+            
+        # Get teacher and distill_factor from batch if available
+        teacher = batch.get('teacher', None)
+        distill_factor = getattr(self.args, 'distill', 0.0)
         
-        LOGGER.debug(f"{log_prefix}{batch_info} - 使用新損失函數計算 - 教師: {has_teacher}, 教師特徵數: {teacher_features_count}, 學生特徵數: {student_features_count}")
+        if teacher is not None:
+            LOGGER.info(f"{log_prefix}{batch_info} - 使用教師模型進行蒸餾, 蒸餾因子={distill_factor}")
+            
+            # Log teacher features status
+            teacher_features = batch.get('teacher_features', {})
+            tf_count = len(teacher_features)
+            LOGGER.info(f"{log_prefix}{batch_info} - 教師特徵數量: {tf_count}")
+            
+            # Log student features status if available
+            student_features = batch.get('student_features', {})
+            sf_count = len(student_features)
+            LOGGER.info(f"{log_prefix}{batch_info} - 學生特徵數量: {sf_count}")
+            
+            # Log raw feature counts too
+            raw_tf_count = len(batch.get('raw_teacher_features', {}))
+            raw_sf_count = len(batch.get('raw_student_features', {}))
+            LOGGER.info(f"{log_prefix}{batch_info} - 原始教師特徵數量: {raw_tf_count}, 原始學生特徵數量: {raw_sf_count}")
+            
+        # Forward pass to get model predictions
+        preds = self.model(batch['img'])
         
-        preds = self.forward(batch["img"])
-        
-        # 使用修改後的 __call__ 方法計算損失
+        # Call loss function with predictions, ground truth and maybe teacher model
         try:
-            if hasattr(self.compute_loss, '__call__'):
-                # 使用新的方法，傳遞教師模型和蒸餾係數
-                loss = self.compute_loss(preds, batch, teacher=teacher, distill_factor=distill_factor)
-                # 檢查返回值是否為元組，需要兼容新舊返回格式
-                if isinstance(loss, tuple) and len(loss) == 2:
-                    LOGGER.debug(f"{log_prefix}{batch_info} - 損失計算完成")
-                    return loss
-                else:
-                    LOGGER.debug(f"{log_prefix}{batch_info} - 損失計算完成，但需要兼容舊格式")
-                    return loss, torch.zeros(5, device=self.device)  # 返回損失和一個空白的損失項目列表
+            LOGGER.info(f"{log_prefix}{batch_info} - 計算損失...")
+            
+            # Call compute_loss with teacher and distill_factor if available
+            loss = self.compute_loss(preds, batch, teacher, distill_factor, batch_idx)
+            
+            # Check loss output format
+            if isinstance(loss, tuple) and len(loss) == 2:
+                loss, loss_items = loss
+                LOGGER.info(f"{log_prefix}{batch_info} - 損失計算成功: 總損失={loss.item()}, 損失項={[li.item() for li in loss_items]}")
             else:
-                LOGGER.error(f"{log_prefix}{batch_info} - compute_loss 物件沒有 __call__ 方法")
-                return None
+                LOGGER.warning(f"{log_prefix}{batch_info} - 損失計算返回格式異常!")
+                loss_items = None
+            
+            # Return appropriate format
+            return loss if self.training else loss_items
+            
         except Exception as e:
-            LOGGER.error(f"{log_prefix}{batch_info} - 計算損失時出錯: {str(e)}")
+            LOGGER.error(f"{log_prefix}{batch_info} - 損失計算時出錯: {str(e)}")
+            # Print stack trace for debugging
             import traceback
             LOGGER.error(traceback.format_exc())
-            return None
+            
+            # In case of error, return a zero tensor to avoid breaking the training loop
+            return torch.zeros(1, device=self.device)
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
