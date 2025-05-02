@@ -71,13 +71,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         self.freezeAllBN = overrides.get("freezeAllBN", False)
         self.target_layers = overrides.get("target_layers", [])
 
-        # Initialize parent class first to set up device and other attributes
-        super().__init__(cfg, overrides, _callbacks)
-
-        # Now we can initialize the teacher model since self.device is available
         if self.teacher_path is not None:
-            self.init_teacher_model()
-            
             if _callbacks is None:
                 _callbacks = callbacks.get_default_callbacks()
 
@@ -89,6 +83,13 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             _callbacks["on_train_end"].append(self.on_train_end)
             _callbacks["teardown"].append(self.teardown)
             _callbacks["on_batch_end"].append(self.on_batch_end)
+
+        # Initialize parent class first to set up device and other attributes
+        super().__init__(cfg, overrides, _callbacks)
+
+        # Now we can initialize the teacher model since self.device is available
+        if self.teacher_path is not None:
+            self.init_teacher_model()
 
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
@@ -224,7 +225,6 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
     def on_batch_end(self, trainer):
         self.batch_is_first_batch_in_epoch = False
         self.batch_train_start = False
-        pass
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """
