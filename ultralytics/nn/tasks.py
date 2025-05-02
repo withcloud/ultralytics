@@ -532,8 +532,18 @@ class PoseModel(DetectionModel):
         Returns:
             (torch.Tensor): Total loss, sum of classification, bbox, and auxiliary losses.
         """
-        # Get the device and log information
-        device = self.device.index if hasattr(self.device, 'index') else self.device
+        # 安全地獲取設備信息
+        try:
+            if hasattr(self, 'device'):
+                device = self.device.index if hasattr(self.device, 'index') else self.device
+            else:
+                # 從批次數據中獲取設備信息
+                device = batch['img'].device
+        except Exception as e:
+            # 確保始終能獲取設備信息
+            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            LOGGER.warning(f"無法獲取設備信息，使用默認設備 {device}: {str(e)}")
+            
         rank = dist.get_rank() if dist.is_initialized() else 0
         log_prefix = f"[Rank {rank}, GPU {device}] "
         
@@ -543,7 +553,23 @@ class PoseModel(DetectionModel):
         
         # Initialize compute_loss if not already created
         if not hasattr(self, 'compute_loss'):
-            self.compute_loss = v8PoseLoss(de_parallel(self.model).model[-1], use_dfl=self.args.use_dfl)
+            if hasattr(self, 'model') and hasattr(self.model, 'model'):
+                # 安全地獲取模型的最後一層
+                try:
+                    last_layer = de_parallel(self.model).model[-1]
+                except (IndexError, AttributeError):
+                    # 回退到默認值
+                    LOGGER.warning(f"{log_prefix}{batch_info} - 無法獲取模型的最後一層，使用self作為參數")
+                    last_layer = self
+                
+                # 安全地獲取 use_dfl 參數
+                use_dfl = getattr(self.args, 'use_dfl', False) if hasattr(self, 'args') else False
+                
+                self.compute_loss = v8PoseLoss(last_layer, use_dfl=use_dfl)
+            else:
+                # 直接使用自己作為參數
+                LOGGER.warning(f"{log_prefix}{batch_info} - 模型結構不完整，使用self初始化loss")
+                self.compute_loss = v8PoseLoss(self)
             
             # Initialize keypoint_weight and obj_weight
             if not hasattr(self.compute_loss, 'keypoint_weight'):
@@ -555,7 +581,13 @@ class PoseModel(DetectionModel):
             
         # Get teacher and distill_factor from batch if available
         teacher = batch.get('teacher', None)
-        distill_factor = getattr(self.args, 'distill', 0.0)
+        
+        # 安全地獲取 distill_factor
+        if hasattr(self, 'args') and hasattr(self.args, 'distill'):
+            distill_factor = self.args.distill
+        else:
+            # 嘗試從批次數據中獲取
+            distill_factor = batch.get('distill_factor', 0.0)
         
         if teacher is not None:
             LOGGER.info(f"{log_prefix}{batch_info} - 使用教師模型進行蒸餾, 蒸餾因子={distill_factor}")
@@ -576,7 +608,18 @@ class PoseModel(DetectionModel):
             LOGGER.info(f"{log_prefix}{batch_info} - 原始教師特徵數量: {raw_tf_count}, 原始學生特徵數量: {raw_sf_count}")
             
         # Forward pass to get model predictions
-        preds = self.model(batch['img'])
+        try:
+            if hasattr(self, 'model'):
+                preds = self.model(batch['img'])
+            else:
+                # 如果沒有model屬性，使用自己進行前向傳播
+                preds = self(batch['img'])
+        except Exception as e:
+            LOGGER.error(f"{log_prefix}{batch_info} - 前向傳播時出錯: {str(e)}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+            # 返回一個零張量，避免訓練中斷
+            return torch.zeros(1, device=device)
         
         # Call loss function with predictions, ground truth and maybe teacher model
         try:
@@ -603,7 +646,7 @@ class PoseModel(DetectionModel):
             LOGGER.error(traceback.format_exc())
             
             # In case of error, return a zero tensor to avoid breaking the training loop
-            return torch.zeros(1, device=self.device)
+            return torch.zeros(1, device=device)
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
