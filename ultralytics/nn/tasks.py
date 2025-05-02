@@ -294,31 +294,36 @@ class BaseModel(torch.nn.Module):
         Compute loss.
 
         Args:
-            batch (dict): Batch to compute loss on.
-            preds (torch.Tensor | List[torch.Tensor], optional): Predictions.
+            batch (dict): Batch containing images, labels, etc.
+            preds (torch.Tensor | list): Predictions of the model.
+
+        Returns:
+            (torch.Tensor): The accumulated loss.
         """
-        if getattr(self, "criterion", None) is None:
+        if not hasattr(self, "criterion"):
             self.criterion = self.init_criterion()
 
-        # Handle teacher if it exists in the batch - mainly for device checking
-        # Actual feature collection is now handled in pose_loss.py
-        if "teacher" in batch and batch["teacher"] is not None:
-            teacher = batch["teacher"]
-            # 確保教師模型在正確的設備上
-            input_device = batch["img"].device
-            
-            # 獲取教師模型的設備（使用參數而不是直接訪問 device 屬性）
-            teacher_device = next(teacher.parameters()).device if list(teacher.parameters()) else input_device
-            
-            if teacher_device != input_device:
-                teacher = teacher.to(input_device)
-                batch["teacher"] = teacher
-            
-            # 不再在此處執行教師模型的前向傳播
-            # 已在 pose_loss.py 中處理
-
-        preds = self.forward(batch["img"]) if preds is None else preds
-        return self.criterion(preds, batch)
+        # Teacher can now be handled completely in the on_train_batch_start hook, not here.
+        # If we have a teacher but no feature collection yet, we'll still show no d_loss 
+        # but the hooks will ensure feature collection happens in subsequent batches.
+        
+        loss = torch.zeros(1, device=self.device)
+        if preds is None:
+            preds = self.forward(batch["img"])
+        
+        # 計算模型的主要損失
+        if isinstance(self.criterion, nn.ModuleList):
+            for i in range(self.model.layers_nl if hasattr(self.model, "layers_nl") else 1):
+                loss += self.criterion[i](preds[i] if isinstance(preds, list) else preds, batch)
+        else:
+            loss += self.criterion(preds, batch)
+        
+        # 如果批次中包含蒸餾損失張量（即前面已計算好的蒸餾損失），直接添加到總損失中
+        if "d_loss_tensor" in batch and batch["d_loss_tensor"] is not None:
+            if isinstance(batch["d_loss_tensor"], torch.Tensor) and not torch.isnan(batch["d_loss_tensor"]) and not torch.isinf(batch["d_loss_tensor"]):
+                loss += batch["d_loss_tensor"]
+                
+        return loss
 
     def init_criterion(self):
         """Initialize the loss criterion for the BaseModel."""
