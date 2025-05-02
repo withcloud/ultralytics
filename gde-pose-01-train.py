@@ -33,7 +33,7 @@ def main():
         epochs=120,             # 初步實驗用20個epoch
         imgsz=640,
         batch=144,
-        device=[0, 1, 2, 3, 4, 5],
+        device=[0, 1, 2, 3],
         workers=16,
         
         # 蒸餾參數
