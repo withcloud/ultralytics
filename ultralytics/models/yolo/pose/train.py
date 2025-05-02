@@ -168,6 +168,8 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         
         print(f"{log_prefix}Starting training...")
         
+        self.model.train_start = True
+        
         if self.teacher is not None:
             # 打印教師模型和學生模型的結構
             print(f"{log_prefix}" + "=" * 80)
@@ -205,7 +207,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         pass
     
     def on_train_end(self, trainer):
-        pass
+        self.model.train_end = True
         
     def teardown(self, trainer):
         pass
