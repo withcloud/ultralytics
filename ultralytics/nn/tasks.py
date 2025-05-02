@@ -305,6 +305,10 @@ class BaseModel(torch.nn.Module):
         # and the forward pass will be done here
         if "teacher" in batch and batch["teacher"] is not None:
             teacher = batch["teacher"]
+            # 確保教師模型在正確的設備上
+            input_device = batch["img"].device
+            teacher = teacher.to(input_device)
+            
             with torch.no_grad():
                 teacher_preds = teacher(batch["img"])
             batch["teacher_preds"] = teacher_preds
