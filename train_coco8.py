@@ -3,9 +3,29 @@ import torch
 import torch.distributed as dist
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
+import sys
+import warnings
 
 # 強制所有進程輸出日誌
 os.environ["RANK"] = "-1"
+
+# 設置環境變量，強制所有進程輸出日誌
+os.environ["RANK"] = "-1"  # 覆蓋 rank 檢查
+LOGGER.setLevel('INFO')  # 設置日誌級別
+
+# 添加本地路徑到 Python 路徑中，確保使用本地版本
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, current_dir)
+sys.path.insert(0, parent_dir)
+
+# 設置環境變量，確保分佈式訓練使用本地代碼
+os.environ["PYTHONPATH"] = f"{current_dir}:{os.environ.get('PYTHONPATH', '')}"
+# 忽略 DDP 的 stride 不匹配警告
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
+# 忽略除零警告
+warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
+
 
 def on_pretrain_routine_start(trainer):
     """在預訓練開始時從所有 GPU 記錄信息"""
