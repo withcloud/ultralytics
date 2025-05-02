@@ -64,18 +64,40 @@ overrides = {vars(trainer.args)}
 
 if __name__ == "__main__":
     from {module} import {name}
-    from ultralytics.utils import DEFAULT_CFG_DICT
+    from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER
+    import builtins
     
     # 強制所有 GPU 進程顯示日誌
     rank = int(os.environ.get("RANK", -1))
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     
+    # 打印函數重定向，確保所有進程輸出
+    original_print = builtins.print
+    def rank_print(*args, **kwargs):
+        gpu_id = local_rank if local_rank != -1 else 0
+        prefix = f"[Rank {{rank}}, GPU {{gpu_id}}] "
+        original_print(prefix, *args, **kwargs)
+    builtins.print = rank_print
+    
     # 設置所有進程顯示 INFO 級別日誌
-    logging_name = "ultralytics"
-    logger = logging.getLogger(logging_name)
-    for handler in logger.handlers:
-        if isinstance(handler, logging.StreamHandler):
-            handler.setLevel(logging.INFO)
+    root_logger = logging.getLogger()
+    # 移除所有現有的處理器
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # 添加新的處理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(message)s')
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    root_logger.setLevel(logging.INFO)
+    
+    # 重新配置 LOGGER
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+    LOGGER.addHandler(console_handler)
+    LOGGER.setLevel(logging.INFO)
     
     # 添加 rank 信息到各個進程的日誌前綴
     gpu_id = local_rank if local_rank != -1 else 0
@@ -84,10 +106,27 @@ if __name__ == "__main__":
     # 輸出啟動信息
     print(f"{{log_prefix}}DDP 進程啟動，RANK={{rank}}, LOCAL_RANK={{local_rank}}")
     
+    # 確保所有進程都初始化完畢
+    if rank != -1:
+        try:
+            dist.barrier()
+            print(f"{{log_prefix}}所有進程同步完畢，開始訓練")
+        except Exception as e:
+            print(f"{{log_prefix}}進程同步失敗: {{e}}")
+    
     cfg = DEFAULT_CFG_DICT.copy()
     cfg.update(save_dir='')   # handle the extra key 'save_dir'
     trainer = {name}(cfg=cfg, overrides=overrides)
     trainer.args.model = "{getattr(trainer.hub_session, "model_url", trainer.args.model)}"
+    
+    # 修改 trainer 中的日誌設置，確保所有進程輸出日誌
+    original_info = LOGGER.info
+    def rank_info(msg, *args, **kwargs):
+        gpu_id = local_rank if local_rank != -1 else 0
+        prefix = f"[Rank {{rank}}, GPU {{gpu_id}}] "
+        original_info(f"{{prefix}}{{msg}}", *args, **kwargs)
+    LOGGER.info = rank_info
+    
     results = trainer.train()
 """
     (USER_CONFIG_DIR / "DDP").mkdir(exist_ok=True)
