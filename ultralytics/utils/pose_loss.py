@@ -81,6 +81,8 @@ class v8PoseLoss(v8DetectionLoss):
         if "teacher" in batch and batch["teacher"] is not None:
             # 輸出 batch 的 keys
             print(f"\nBatch keys: {list(batch.keys())}")
+
+            print(f"batch['train_start']: {batch['train_start']}")
             
             # 如果需要更詳細的信息，可以輸出每個 key 的數據類型和形狀
             for key in batch.keys():
