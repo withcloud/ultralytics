@@ -67,7 +67,7 @@ class v8PoseLoss(v8DetectionLoss):
         """Calculate the total loss and detach it for pose estimation."""
 
         if "teacher" in batch and batch["teacher"] is not None:
-            teacher = batch["teacher"]
+            teacher = batch["teacher"].to(batch["img"].device)
             with torch.no_grad():
                 teacher_preds = teacher(batch["img"])
 
