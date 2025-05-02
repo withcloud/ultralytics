@@ -30,7 +30,7 @@ def main():
     results = model.train(
         # 基本訓練設置
         data="coco-pose.yaml",
-        epochs=100,             # 初步實驗用20個epoch
+        epochs=120,             # 初步實驗用20個epoch
         imgsz=640,
         batch=144,
         device=[0, 1, 2, 3, 4, 5],
@@ -82,7 +82,7 @@ def main():
         amp=True,             # 混合精度訓練
         
         # 早停策略
-        patience=20,          # 20個epoch無改善則早停
+        patience=30,          # 20個epoch無改善則早停
         
         # 穩定性設置
         seed=42,              # 固定隨機種子
