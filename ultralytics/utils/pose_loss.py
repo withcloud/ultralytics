@@ -79,6 +79,12 @@ class v8PoseLoss(v8DetectionLoss):
         # 推理之前，要註冊勾子
         # 檢查是否 train_start 為 True
         if "teacher" in batch and batch["teacher"] is not None:
+            # 輸出 self.model 的屬性
+            print(f"\nModel attributes:")
+            for attr in dir(self.model):
+                if not attr.startswith('_'):
+                    print(f"  {attr}: {getattr(self.model, attr)}")
+
             # 輸出 batch 的 keys
             print(f"\nBatch keys: {list(batch.keys())}")
             
