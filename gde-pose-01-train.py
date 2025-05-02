@@ -72,8 +72,8 @@ def main():
         mosaic=1.0,           # 使用mosaic增強
         
         # 保存與評估
-        save_period=10,       # 每10個epoch保存一次
-        val=10,               # 每10個epoch驗證一次
+        save_period=1,
+        val=True,
         name="gde_distill_01_layers",
         project="gde_pose_distill",
         exist_ok=True,
