@@ -30,7 +30,7 @@ def main():
     results = model.train(
         # 基本訓練設置
         data="coco-pose.yaml",
-        epochs=20,             # 初步實驗用20個epoch
+        epochs=100,             # 初步實驗用20個epoch
         imgsz=640,
         batch=126,             # 4個4090的大批量
         device=[0, 1, 2, 3, 4, 5],
@@ -39,31 +39,54 @@ def main():
         # 蒸餾參數
         teacher="yolo11n-pose.pt",
         target_layers=["model.0.conv", "model.1.conv"],
-        distill=0.0,           # 較高蒸餾權重
+        distill=0.8,           # 較高蒸餾權重
         freezeAllBN=True,
 
-        box=0.00001, # (float) box loss gain
-        cls=0.00001, # (float) cls loss gain (scale with pixels)
-        dfl=0.00001, # (float) dfl loss gain
-        pose=0.00001, # (float) pose loss gain
-        kobj=0.00001, # (float) keypoint obj loss gain
+        # box=0.00001, # (float) box loss gain
+        # cls=0.00001, # (float) cls loss gain (scale with pixels)
+        # dfl=0.00001, # (float) dfl loss gain
+        # pose=0.00001, # (float) pose loss gain
+        # kobj=0.00001, # (float) keypoint obj loss gain
         
         # 優化器設置
-        optimizer="SGD",
-        lr0=0.000001,             # 適中的學習率
-        lrf=0.001,               # 學習率可以衰減更多
-        weight_decay=0.0,
-        warmup_epochs=2,
+        optimizer="AdamW",    # AdamW通常更穩定
+        lr0=0.001,            # 初始學習率
+        lrf=0.01,             # 最終學習率因子
+        momentum=0.937,       # 動量參數
+        weight_decay=0.0005,  # 權重衰減
+        
+        # 訓練策略
+        warmup_epochs=3.0,    # 預熱epochs
+        cos_lr=True,          # 使用余弦學習率調度
+        close_mosaic=10,      # 最後10個epoch關閉mosaic
+        
+        # 數據增強設置
+        hsv_h=0.015,          # 色調變化
+        hsv_s=0.7,            # 飽和度變化
+        hsv_v=0.4,            # 亮度變化
+        degrees=10.0,         # 旋轉角度範圍
+        translate=0.1,        # 平移比例
+        scale=0.5,            # 縮放比例
+        shear=2.0,            # 剪切角度
+        fliplr=0.5,           # 左右翻轉
+        mosaic=1.0,           # 使用mosaic增強
         
         # 保存與評估
-        save_period=1,
-        val=True,
-        amp=True,
-        
-        # 實驗命名
+        save_period=10,       # 每10個epoch保存一次
+        val=10,               # 每10個epoch驗證一次
         name="gde_distill_01_layers",
         project="gde_pose_distill",
-        exist_ok=True
+        exist_ok=True,
+        
+       # 性能相關
+        amp=True,             # 混合精度訓練
+        
+        # 早停策略
+        patience=20,          # 20個epoch無改善則早停
+        
+        # 穩定性設置
+        seed=42,              # 固定隨機種子
+        deterministic=True,   # 確保結果可複現
     )
 
 if __name__ == "__main__":
