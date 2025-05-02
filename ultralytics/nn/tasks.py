@@ -554,8 +554,13 @@ class PoseModel(DetectionModel):
             if hasattr(self.compute_loss, '__call__'):
                 # 使用新的方法，傳遞教師模型和蒸餾係數
                 loss = self.compute_loss(preds, batch, teacher=teacher, distill_factor=distill_factor)
-                LOGGER.debug(f"{log_prefix}{batch_info} - 損失計算完成: {loss[0].item():.4f}")
-                return loss
+                # 檢查返回值是否為元組，需要兼容新舊返回格式
+                if isinstance(loss, tuple) and len(loss) == 2:
+                    LOGGER.debug(f"{log_prefix}{batch_info} - 損失計算完成")
+                    return loss
+                else:
+                    LOGGER.debug(f"{log_prefix}{batch_info} - 損失計算完成，但需要兼容舊格式")
+                    return loss, torch.zeros(5, device=self.device)  # 返回損失和一個空白的損失項目列表
             else:
                 LOGGER.error(f"{log_prefix}{batch_info} - compute_loss 物件沒有 __call__ 方法")
                 return None

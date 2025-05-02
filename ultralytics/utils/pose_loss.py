@@ -82,7 +82,7 @@ class v8PoseLoss(v8DetectionLoss):
         else:
             log_batch = "current batch"
             
-        LOGGER.debug(f"{log_prefix}處理 {log_batch} 的損失計算")
+        LOGGER.info(f"{log_prefix}{log_batch} - 處理損失計算 - 特徵收集狀態: 教師特徵={len(batch.get('teacher_features', {}))}, 學生特徵={len(batch.get('student_features', {}))}")
         
         loss = torch.zeros(6, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility, distill
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
@@ -148,6 +148,22 @@ class v8PoseLoss(v8DetectionLoss):
         if teacher is not None and distill_factor is not None and distill_factor > 0:
             teacher_features = batch.get("teacher_features", {})
             student_features = batch.get("student_features", {})
+            
+            if teacher_features:
+                # 檢查教師特徵內容
+                LOGGER.info(f"{log_prefix}{log_batch} - 教師特徵鍵: {list(teacher_features.keys())}")
+                for k in list(teacher_features.keys())[:2]:  # 只顯示前兩個，避免日誌過長
+                    feat = teacher_features[k]
+                    if isinstance(feat, torch.Tensor):
+                        LOGGER.info(f"{log_prefix}{log_batch} - 教師特徵[{k}] 形狀: {feat.shape}, 設備: {feat.device}")
+                
+            if student_features:
+                # 檢查學生特徵內容
+                LOGGER.info(f"{log_prefix}{log_batch} - 學生特徵鍵: {list(student_features.keys())}")
+                for k in list(student_features.keys())[:2]:  # 只顯示前兩個，避免日誌過長
+                    feat = student_features[k]
+                    if isinstance(feat, torch.Tensor):
+                        LOGGER.info(f"{log_prefix}{log_batch} - 學生特徵[{k}] 形狀: {feat.shape}, 設備: {feat.device}")
             
             if should_log:
                 LOGGER.info(f"{log_prefix}{log_batch} - 將使用教師模型進行蒸餾，係數={distill_factor}")
@@ -280,6 +296,9 @@ class v8PoseLoss(v8DetectionLoss):
                 f"{log_prefix}Loss components: box={loss[0]:.4f}, pose={loss[1]:.4f}, "
                 f"kobj={loss[2]:.4f}, cls={loss[3]:.4f}, dfl={loss[4]:.4f}, distill={loss[5]:.4f}"
             )
+            
+        # 摘要輸出損失值用於調試
+        LOGGER.info(f"{log_prefix}{log_batch} - 總損失: {loss.sum():.4f}, 蒸餾損失: {loss[5]:.4f}")
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
