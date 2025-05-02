@@ -198,6 +198,18 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             batch["teacher_features"] = self.teacher_features
             batch["student_features"] = self.student_features
             
+            # 在 DDP 環境下記錄目標層細節，幫助調試
+            if dist.is_initialized() and rank > 0:  # 只在非主要進程上記錄
+                LOGGER.info(f"{log_prefix}使用目標層: {self.target_layers}")
+                # 檢查模型結構
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    model_str = "DistributedDataParallel"
+                    module_str = str(type(self.model.module))
+                else:
+                    model_str = str(type(self.model))
+                    module_str = "N/A"
+                LOGGER.info(f"{log_prefix}模型類型: {model_str}, 模塊類型: {module_str}")
+            
         return batch
             
     def preprocess_batch(self, batch):
@@ -224,9 +236,16 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             
             LOGGER.info(f"{log_prefix}Registering hooks for teacher model:")
             
+            # 檢查是否為 DDP 模型
+            if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
+                LOGGER.info(f"{log_prefix}檢測到教師模型為 DDP 模型，使用 teacher.module")
+                base_teacher = self.teacher.module
+            else:
+                base_teacher = self.teacher
+            
             # 建立模塊名稱到模塊的映射
             module_dict = {}
-            for name, module in self.teacher.named_modules():
+            for name, module in base_teacher.named_modules():
                 module_dict[name] = module
                 
             # 處理每個目標層
@@ -234,7 +253,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 if isinstance(target, int):
                     # 如果是整數索引，直接獲取對應層
                     try:
-                        layer = self.teacher.model[target]
+                        layer = base_teacher.model[target]
                         layer_full_name = f"model.{target}"
                         layer_idx = target  # 用於hook的layer_idx
                     except IndexError:
@@ -293,7 +312,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 self.teacher_features = {}
                 return None
             
-            self.teacher_hooks.append(self.teacher.register_forward_pre_hook(pre_forward_hook))
+            if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
+                self.teacher_hooks.append(self.teacher.module.register_forward_pre_hook(pre_forward_hook))
+            else:
+                self.teacher_hooks.append(self.teacher.register_forward_pre_hook(pre_forward_hook))
             
             LOGGER.info(f"{log_prefix}教師模型勾子註冊完成，共 {len(self.teacher_hooks)} 個勾子")
             
@@ -311,9 +333,16 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         
         LOGGER.info(f"{log_prefix}Registering hooks for student model:")
         
+        # 檢查是否為 DDP 模型
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            LOGGER.info(f"{log_prefix}檢測到 DDP 模型，使用 model.module 而不是 model")
+            base_model = self.model.module
+        else:
+            base_model = self.model
+        
         # 建立模塊名稱到模塊的映射
         module_dict = {}
-        for name, module in self.model.named_modules():
+        for name, module in base_model.named_modules():
             module_dict[name] = module
             
         # 處理每個目標層
@@ -321,7 +350,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             if isinstance(target, int):
                 # 如果是整數索引，直接獲取對應層
                 try:
-                    layer = self.model.model[target]
+                    layer = base_model.model[target]
                     layer_full_name = f"model.{target}"
                     layer_idx = target  # 用於hook的layer_idx
                 except IndexError:
@@ -386,7 +415,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             self.student_features = {}
             return None
         
-        self.student_hooks.append(self.model.register_forward_pre_hook(pre_forward_hook))
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            self.student_hooks.append(self.model.module.register_forward_pre_hook(pre_forward_hook))
+        else:
+            self.student_hooks.append(self.model.register_forward_pre_hook(pre_forward_hook))
 
     def _save_teacher_feature(self, layer_idx, feature):
         """Save features from the teacher model."""
