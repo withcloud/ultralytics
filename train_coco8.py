@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch.distributed as dist
 import warnings
 
+os.environ["RANK"] = "-1"  # 覆蓋 rank 檢查
+LOGGER.setLevel('INFO')  # 設置日誌級別
+
 # 添加本地路徑到 Python 路徑中，確保使用本地版本
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
