@@ -58,30 +58,30 @@ class v8PoseLoss(v8DetectionLoss):
         sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
         self.mse_loss = nn.MSELoss(reduction='mean')
-        
-        # Initialize batch counter for logging control
-        self.batch_counter = 0
-        self.log_interval = 10  # Log every 10 batches
+
         self.model = model
+
+        self.teacher_features = {}
+        self.student_features = {}
+        self.teacher_hooks = []
+        self.student_hooks = []
 
     def __call__(self, preds, batch):
         """Calculate the total loss and detach it for pose estimation."""
 
+        # 教師模型推理
         if "teacher" in batch and batch["teacher"] is not None:
-            teacher = batch["teacher"].to(batch["img"].device)
+            teacher = batch["teacher"].to(self.device)
             with torch.no_grad():
                 teacher_preds = teacher(batch["img"])
 
+        # 學生模型推理
         preds = self.model.forward(batch["img"])
 
-        
         # Get rank for distributed training (for logging)
         rank = dist.get_rank() if dist.is_initialized() else 0
         gpu_id = self.device.index if hasattr(self.device, 'index') else 0
         log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
-        
-        # Increment batch counter
-        self.batch_counter += 1
         
         loss = torch.zeros(6, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility, distill
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
@@ -138,9 +138,6 @@ class v8PoseLoss(v8DetectionLoss):
             loss[1], loss[2] = self.calculate_keypoints_loss(
                 fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
             )
-
-        # Calculate distillation loss for the specified target layers if the teacher is available
-        should_log = self.batch_counter % self.log_interval == 0  # Only log every log_interval batches
         
         if "teacher" in batch and batch["teacher"] is not None and "teacher_features" in batch and "student_features" in batch:
             # Get the cached features from the batch
@@ -215,8 +212,8 @@ class v8PoseLoss(v8DetectionLoss):
                 f"kobj={loss[2]:.4f}, cls={loss[3]:.4f}, dfl={loss[4]:.4f}, distill={loss[5]:.4f}"
             )
 
-            if rank == 1:
-                raise Exception(describe_var(teacher_preds))
+            # if rank == 1:
+            #     raise Exception(describe_var(teacher_preds))
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
