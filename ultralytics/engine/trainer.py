@@ -288,17 +288,15 @@ class BaseTrainer:
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, rank=LOCAL_RANK, mode="train")
-        if RANK in {-1, 0}:
-            # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
-            self.test_loader = self.get_dataloader(
-                self.testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
-            )
-            self.validator = self.get_validator()
-            metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
-            self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            self.ema = ModelEMA(self.model)
-            if self.args.plots:
-                self.plot_training_labels()
+        self.test_loader = self.get_dataloader(
+            self.testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
+        )
+        self.validator = self.get_validator()
+        metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
+        self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
+        self.ema = ModelEMA(self.model)
+        if self.args.plots and RANK in {-1, 0}:  # 繪圖僅在主進程執行
+            self.plot_training_labels()
 
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
@@ -426,13 +424,18 @@ class BaseTrainer:
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
-            if RANK in {-1, 0}:
-                final_epoch = epoch + 1 >= self.epochs
-                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+            
+            # 讓所有 GPU 進程都更新 EMA，並執行驗證
+            # 原本: if RANK in {-1, 0}:
+            final_epoch = epoch + 1 >= self.epochs
+            self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
-                # Validation
-                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                    self.metrics, self.fitness = self.validate()
+            # Validation
+            if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+                self.metrics, self.fitness = self.validate()
+                
+            # 只有 rank 0 保存結果
+            if RANK in {-1, 0}:
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
