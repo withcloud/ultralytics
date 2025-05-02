@@ -186,6 +186,51 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             gpu_id = self.device.index if hasattr(self.device, 'index') else 0
             log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
             
+            # 記錄批次信息
+            batch_idx = batch.get("batch_idx", None)
+            if batch_idx is not None:
+                batch_info = f"處理批次 {batch_idx.min().item() if isinstance(batch_idx, torch.Tensor) else batch_idx}"
+            else:
+                batch_info = "處理未知批次"
+            
+            LOGGER.info(f"{log_prefix}{batch_info} - 目標層: {self.target_layers}")
+            
+            # 詳細檢查教師模型結構
+            if isinstance(self.teacher, torch.nn.parallel.DistributedDataParallel):
+                teacher_base = self.teacher.module
+                teacher_type = "DDP wrapped"
+            else:
+                teacher_base = self.teacher
+                teacher_type = type(self.teacher).__name__
+                
+            LOGGER.info(f"{log_prefix}{batch_info} - 教師模型類型: {teacher_type}")
+            
+            # 檢查模型.model屬性
+            try:
+                if hasattr(teacher_base, 'model'):
+                    model_len = len(teacher_base.model) if hasattr(teacher_base.model, '__len__') else "未知"
+                    LOGGER.info(f"{log_prefix}{batch_info} - 教師模型結構: model長度={model_len}")
+                    
+                    # 輸出一些關鍵層信息
+                    for i in range(min(15, len(teacher_base.model) if hasattr(teacher_base.model, '__len__') else 0)):
+                        layer = teacher_base.model[i]
+                        layer_type = type(layer).__name__
+                        has_conv = hasattr(layer, 'conv')
+                        LOGGER.info(f"{log_prefix}{batch_info} - 教師層 model.{i}: {layer_type}, 含conv: {has_conv}")
+                else:
+                    LOGGER.warning(f"{log_prefix}{batch_info} - 教師模型沒有model屬性")
+            except Exception as e:
+                LOGGER.warning(f"{log_prefix}{batch_info} - 檢查教師模型結構時出錯: {str(e)}")
+            
+            # 輸出模塊信息
+            LOGGER.info(f"{log_prefix}{batch_info} - 教師模型模塊信息:")
+            module_count = 0
+            for name, module in teacher_base.named_modules():
+                if module_count < 10 and (name.startswith("model.") or not name):
+                    module_type = type(module).__name__
+                    LOGGER.info(f"{log_prefix}{batch_info} - 模塊 {name}: {module_type}")
+                    module_count += 1
+            
             # 確保教師模型在正確的設備上
             if "img" in batch:
                 input_device = batch["img"].device
@@ -194,42 +239,97 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                     has_params = any(True for _ in self.teacher.parameters())
                     if has_params:
                         teacher_device = next(self.teacher.parameters()).device
+                        LOGGER.info(f"{log_prefix}{batch_info} - 教師模型設備: {teacher_device}, 輸入設備: {input_device}")
                         if teacher_device != input_device:
+                            LOGGER.info(f"{log_prefix}{batch_info} - 將教師模型從 {teacher_device} 移動到 {input_device}")
                             self.teacher = self.teacher.to(input_device)
-                            LOGGER.info(f"{log_prefix}將教師模型從 {teacher_device} 移動到 {input_device}")
                     else:
-                        LOGGER.warning(f"{log_prefix}教師模型似乎沒有參數")
+                        LOGGER.warning(f"{log_prefix}{batch_info} - 教師模型似乎沒有參數")
                 except Exception as e:
-                    LOGGER.warning(f"{log_prefix}檢查教師模型設備時出錯: {str(e)}")
+                    LOGGER.warning(f"{log_prefix}{batch_info} - 檢查教師模型設備時出錯: {str(e)}")
             
-            # 確保特徵收集勾子存在
+            # 檢查並可能重新註冊勾子
+            LOGGER.info(f"{log_prefix}{batch_info} - 當前教師勾子: {len(self.teacher_hooks)}, 當前學生勾子: {len(self.student_hooks)}")
+            
+            # 如果勾子為空，重新註冊
             if not self.teacher_hooks:
-                LOGGER.warning(f"{log_prefix}重新註冊教師模型勾子")
+                LOGGER.warning(f"{log_prefix}{batch_info} - 教師模型勾子為空，重新註冊")
                 self.register_teacher_hooks()
             
             if not self.student_hooks:
-                LOGGER.warning(f"{log_prefix}重新註冊學生模型勾子")
+                LOGGER.warning(f"{log_prefix}{batch_info} - 學生模型勾子為空，重新註冊")
                 self.register_student_hooks()
-                
-            # 記錄勾子數量
-            LOGGER.info(f"{log_prefix}當前教師模型勾子數: {len(self.teacher_hooks)}, 學生模型勾子數: {len(self.student_hooks)}")
+            
+            # 進行前向傳播測試，確保勾子能收集特徵
+            try:
+                LOGGER.info(f"{log_prefix}{batch_info} - 進行前向傳播測試以驗證勾子...")
+                with torch.no_grad():
+                    # 創建小的測試輸入
+                    dummy_input = torch.zeros(1, 3, 224, 224).to(self.device)
+                    
+                    # 清除現有特徵
+                    self.teacher_features = {}
+                    self.student_features = {}
+                    
+                    # 執行教師模型前向傳播
+                    _ = self.teacher(dummy_input)
+                    # 執行學生模型前向傳播
+                    if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                        _ = self.model.module(dummy_input)
+                    else:
+                        _ = self.model(dummy_input)
+                    
+                    # 檢查特徵收集結果
+                    t_features_count = len(self.teacher_features)
+                    s_features_count = len(self.student_features)
+                    
+                    LOGGER.info(f"{log_prefix}{batch_info} - 前向傳播測試結果:")
+                    LOGGER.info(f"{log_prefix}{batch_info} - 收集到 {t_features_count} 個教師特徵, 鍵: {list(self.teacher_features.keys())}")
+                    LOGGER.info(f"{log_prefix}{batch_info} - 收集到 {s_features_count} 個學生特徵, 鍵: {list(self.student_features.keys())}")
+                    
+                    # 如果測試後仍沒有特徵，檢查目標層配置
+                    if t_features_count == 0:
+                        LOGGER.error(f"{log_prefix}{batch_info} - ⚠️ 教師模型前向傳播測試後仍未收集到特徵!")
+                        LOGGER.error(f"{log_prefix}{batch_info} - ⚠️ 請檢查目標層配置: {self.target_layers}")
+                        # 嘗試使用不同的目標層設置
+                        suggested_layers = []
+                        if hasattr(teacher_base, 'model') and hasattr(teacher_base.model, '__len__'):
+                            for i in range(min(len(teacher_base.model), 12)):
+                                if hasattr(teacher_base.model[i], 'conv'):
+                                    suggested_layers.append(f"model.{i}")
+                        if suggested_layers:
+                            LOGGER.info(f"{log_prefix}{batch_info} - 建議嘗試這些目標層: {suggested_layers}")
+                    if s_features_count == 0:
+                        LOGGER.error(f"{log_prefix}{batch_info} - ⚠️ 學生模型前向傳播測試後仍未收集到特徵!")
+            except Exception as e:
+                LOGGER.error(f"{log_prefix}{batch_info} - 前向傳播測試時出錯: {str(e)}")
+            
+            # 清除測試特徵，準備實際批次處理
+            self.teacher_features = {}
+            self.student_features = {}
             
             # 將教師模型和特徵添加到批次
             batch["teacher"] = self.teacher
             batch["teacher_features"] = self.teacher_features
             batch["student_features"] = self.student_features
             
-            # 在 DDP 環境下記錄目標層細節，幫助調試
-            if dist.is_initialized() and rank > 0:  # 只在非主要進程上記錄
-                LOGGER.info(f"{log_prefix}使用目標層: {self.target_layers}")
-                # 檢查模型結構
-                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-                    model_str = "DistributedDataParallel"
-                    module_str = str(type(self.model.module))
-                else:
-                    model_str = str(type(self.model))
-                    module_str = "N/A"
-                LOGGER.info(f"{log_prefix}模型類型: {model_str}, 模塊類型: {module_str}")
+            # 在實際輸入上執行教師模型前向傳播，確保特徵被收集
+            try:
+                LOGGER.info(f"{log_prefix}{batch_info} - 對實際批次執行前向傳播...")
+                with torch.no_grad():
+                    if "img" in batch:
+                        # 執行教師模型前向傳播
+                        _ = self.teacher(batch["img"])
+                        # 記錄收集結果
+                        LOGGER.info(f"{log_prefix}{batch_info} - 前向傳播後收集到 {len(self.teacher_features)} 個教師特徵")
+                        if self.teacher_features:
+                            LOGGER.info(f"{log_prefix}{batch_info} - 教師特徵鍵: {list(self.teacher_features.keys())}")
+                            # 顯示一個特徵的形狀以供診斷
+                            for key in list(self.teacher_features.keys())[:1]:
+                                feat = self.teacher_features[key]
+                                LOGGER.info(f"{log_prefix}{batch_info} - 特徵[{key}]形狀: {feat.shape}, 設備: {feat.device}")
+            except Exception as e:
+                LOGGER.error(f"{log_prefix}{batch_info} - 對實際批次執行前向傳播時出錯: {str(e)}")
             
         return batch
             

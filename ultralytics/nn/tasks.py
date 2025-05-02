@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -94,6 +95,8 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
+from ultralytics.utils.metrics import OKS_SIGMA
+from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 
 try:
     import thop
@@ -514,6 +517,54 @@ class PoseModel(DetectionModel):
             cfg["kpt_shape"] = data_kpt_shape
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
+    def loss(self, batch, feature_distill=False):
+        """Calculate pose losses with optional feature distillation."""
+        if not hasattr(self, 'compute_loss'):
+            self.compute_loss = v8PoseLoss(self)
+        
+        # 從批次中提取蒸餾相關信息
+        teacher = batch.get("teacher", None)
+        teacher_features = batch.get("teacher_features", {})
+        student_features = batch.get("student_features", {})
+        distill_factor = getattr(self, 'distill', 1.0) if teacher is not None else None
+        
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        # 用於日誌的批次信息
+        batch_idx = batch.get("batch_idx", None)
+        if batch_idx is not None:
+            batch_info = f"批次 {batch_idx.min().item() if isinstance(batch_idx, torch.Tensor) else batch_idx}"
+        else:
+            batch_info = "未知批次"
+            
+        # 檢查並記錄特徵收集情況
+        has_teacher = teacher is not None
+        teacher_features_count = len(teacher_features) if teacher_features else 0
+        student_features_count = len(student_features) if student_features else 0
+        
+        LOGGER.debug(f"{log_prefix}{batch_info} - 使用新損失函數計算 - 教師: {has_teacher}, 教師特徵數: {teacher_features_count}, 學生特徵數: {student_features_count}")
+        
+        preds = self.forward(batch["img"])
+        
+        # 使用修改後的 __call__ 方法計算損失
+        try:
+            if hasattr(self.compute_loss, '__call__'):
+                # 使用新的方法，傳遞教師模型和蒸餾係數
+                loss = self.compute_loss(preds, batch, teacher=teacher, distill_factor=distill_factor)
+                LOGGER.debug(f"{log_prefix}{batch_info} - 損失計算完成: {loss[0].item():.4f}")
+                return loss
+            else:
+                LOGGER.error(f"{log_prefix}{batch_info} - compute_loss 物件沒有 __call__ 方法")
+                return None
+        except Exception as e:
+            LOGGER.error(f"{log_prefix}{batch_info} - 計算損失時出錯: {str(e)}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+            return None
+
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return v8PoseLoss(self)
@@ -801,7 +852,10 @@ class WorldModel(DetectionModel):
             preds (torch.Tensor | List[torch.Tensor], optional): Predictions.
         """
         if not hasattr(self, "criterion"):
-            self.criterion = self.init_criterion()
+            from ultralytics.utils.loss import TVPDetectLoss
+
+            visual_prompt = batch.get("visuals", None) is not None  # TODO
+            self.criterion = TVPDetectLoss(self) if visual_prompt else self.init_criterion()
 
         if preds is None:
             preds = self.forward(batch["img"], txt_feats=batch["txt_feats"])
