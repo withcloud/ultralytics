@@ -90,7 +90,7 @@ class v8PoseLoss(v8DetectionLoss):
             #         print(f"  {key}: None")
             #     else:
             #         print(f"  {key}: {type(batch[key]).__name__}")
-            if batch["batch_train_start"]:
+            if batch["train_start"]:
                 # 註冊勾子
                 print(f"\n\n註冊勾子!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                 self.register_teacher_hooks()
