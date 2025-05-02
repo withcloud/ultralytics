@@ -53,7 +53,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 - teacher: Path to teacher model weights file
                 - distill: Weight for distillation loss (default: 1.0)
                 - freezeAllBN: Whether to freeze all BatchNorm layers (default: False)
-                - target_layers: List of layer indices or names for feature distillation (default: [6, 8, 10])
+                - target_layers: List of layer indices or names for feature distillation (default: ["model.6", "model.8", "model.10"])
             _callbacks (list, optional): List of callback functions to be executed during training.
 
         Notes:
@@ -75,12 +75,17 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         self.distill = overrides.get("distill", 1.0)
         self.freezeAllBN = overrides.get("freezeAllBN", False)
         
-        # 默認目標層 - 通常中間層效果較好用於特徵蒸餾
-        default_layers = [6, 8, 10]  # 預設使用中間層進行特徵蒸餾
+        # 默認目標層 - 在 DDP 環境中使用字符串路徑而不是索引
+        default_layers = ["model.6", "model.8", "model.10"]  # 使用模塊路徑代替索引
         self.target_layers = overrides.get("target_layers", default_layers)
         if not self.target_layers and self.teacher_path:
             LOGGER.warning(f"未指定目標層，使用默認值: {default_layers}，可通過 'target_layers' 參數指定")
             self.target_layers = default_layers
+        
+        # 將索引轉換為字符串路徑，避免 DDP 環境中的問題
+        for i, layer in enumerate(self.target_layers):
+            if isinstance(layer, int):
+                self.target_layers[i] = f"model.{layer}"
         
         # For collecting features from layers
         self.teacher_features = {}
@@ -563,13 +568,16 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         
         # 重新檢查勾子
         if self.teacher is not None:
+            # 獲取進程和設備信息
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+            
             # 每 10 批次檢查一次勾子是否正常
-            if trainer.epoch % 10 == 0 and trainer.batch % 10 == 0:
-                # 獲取進程和設備信息
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                gpu_id = self.device.index if hasattr(self.device, 'index') else 0
-                log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
-                
+            # 注意：在 DDP 模式下，trainer.batch 可能不是我們期望的值
+            ni = getattr(trainer, 'batch_idx', 0) if hasattr(trainer, 'batch_idx') else 0
+            
+            if (trainer.epoch == 0 and ni == 0) or (trainer.epoch % 10 == 0 and ni % 10 == 0):
                 # 檢查勾子數量
                 if not self.teacher_hooks or len(self.teacher_hooks) < len(self.target_layers):
                     LOGGER.warning(f"{log_prefix}教師模型勾子數量不足或為空，重新註冊")
@@ -578,6 +586,29 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
                 if not self.student_hooks:
                     LOGGER.warning(f"{log_prefix}學生模型勾子數量不足或為空，重新註冊")
                     self.register_student_hooks()
+                    
+                # 檢查模型類型
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    LOGGER.info(f"{log_prefix}當前使用 DDP 模型")
+                    # 嘗試檢查模型結構
+                    try:
+                        model_layers = len(list(self.model.module.model))
+                        LOGGER.info(f"{log_prefix}學生模型層數: {model_layers}")
+                    except Exception as e:
+                        LOGGER.warning(f"{log_prefix}無法獲取學生模型層數: {str(e)}")
+                        
+                    for target in self.target_layers:
+                        if isinstance(target, int):
+                            try:
+                                layer = self.model.module.model[target]
+                                LOGGER.info(f"{log_prefix}成功找到學生模型層 {target}: {type(layer).__name__}")
+                            except (IndexError, AttributeError) as e:
+                                LOGGER.warning(f"{log_prefix}無法訪問學生模型層 {target}: {str(e)}")
+                                # 建議使用不同的目標層
+                                LOGGER.info(f"{log_prefix}建議使用模塊名稱而不是索引，或使用正確的索引範圍: 0-{model_layers-1 if 'model_layers' in locals() else 'unknown'}")
+                                
+                # 檢查特徵字典
+                LOGGER.info(f"{log_prefix}教師特徵: {bool(self.teacher_features)}, 學生特徵: {bool(self.student_features)}")
 
     def set_target_layers(self, new_target_layers):
         """
