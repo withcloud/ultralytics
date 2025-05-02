@@ -49,10 +49,10 @@ def main():
         kobj=0.00001, # (float) keypoint obj loss gain
         
         # 優化器設置
-        optimizer="Adam",
-        lr0=0.001,             # 適中的學習率
-        lrf=0.1,               # 學習率可以衰減更多
-        weight_decay=0.0005,
+        optimizer="SGD",
+        lr0=0.000001,             # 適中的學習率
+        lrf=0.001,               # 學習率可以衰減更多
+        weight_decay=0.0,
         warmup_epochs=2,
         
         # 保存與評估
