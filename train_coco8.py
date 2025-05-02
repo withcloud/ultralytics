@@ -31,10 +31,10 @@ def main():
         data="coco8-pose.yaml",
         epochs=20,
         imgsz=640,
-        device=[0, 1],
+        device=[0, 1, 2, 3],
 
         teacher="yolo11n-pose.pt",
-        target_layers=["model.0.conv", 1],
+        target_layers=["model.0.conv", "model.1.conv"],
 
         # freezeAllBN=True,
         # freeze=23,
