@@ -30,63 +30,62 @@ def main():
     results = model.train(
         # 基本訓練設置
         data="coco-pose.yaml",
-        epochs=180,             # 初步實驗用20個epoch
+        epochs=180,             
         imgsz=640,
-        batch=144,
+        batch=160,              # 適度增加批量
         device=[0, 1, 2, 3],
         workers=16,
         
-        # 蒸餾參數
+        # 蒸餾參數 - 更激進版本
         teacher="yolo11n-pose.pt",
         target_layers=["model.0.conv", "model.1.conv", "model.2.cv1.conv", "model.2.cv2.conv", "model.3.conv", "model.4.cv1.conv", "model.4.cv2.conv", "model.5.conv", "model.6.cv1.conv", "model.6.cv2.conv", "model.7.conv"],
-        distill=0.8,           # 較高蒸餾權重
+        distill=0.9,            # 增加蒸餾權重
         freezeAllBN=False,
 
-        # box=0.00001, # (float) box loss gain
-        # cls=0.00001, # (float) cls loss gain (scale with pixels)
-        # dfl=0.00001, # (float) dfl loss gain
-        pose=15.0, # (float) pose loss gain
-        # kobj=0.00001, # (float) keypoint obj loss gain
+        # 損失函數權重 - 更激進版本
+        pose=18.0,              # 增加姿態損失權重
+        kobj=2.5,               # 增加關鍵點目標性損失權重
         
-        # 優化器設置
-        optimizer="AdamW",    # AdamW通常更穩定
-        lr0=0.001,            # 初始學習率
-        lrf=0.01,             # 最終學習率因子
-        momentum=0.937,       # 動量參數
-        weight_decay=0.0005,  # 權重衰減
+        # 優化器設置 - 更激進版本
+        optimizer="AdamW",      
+        lr0=0.0015,             # 更高的學習率
+        lrf=0.01,              
+        momentum=0.937,        
+        weight_decay=0.0005,   
         
-        # 訓練策略
-        warmup_epochs=5.0,    # 預熱epochs
-        cos_lr=True,          # 使用余弦學習率調度
-        close_mosaic=10,      # 最後10個epoch關閉mosaic
+        # 訓練策略 - 更激進版本
+        warmup_epochs=3.0,      # 縮短預熱時間
+        cos_lr=True,            
+        close_mosaic=15,        # 延後關閉mosaic
         
-        # 數據增強設置
-        hsv_h=0.015,          # 色調變化
-        hsv_s=0.7,            # 飽和度變化
-        hsv_v=0.4,            # 亮度變化
-        degrees=10.0,         # 旋轉角度範圍
-        translate=0.1,        # 平移比例
-        scale=0.5,            # 縮放比例
-        shear=2.0,            # 剪切角度
-        fliplr=0.5,           # 左右翻轉
-        mosaic=1.0,           # 使用mosaic增強
+        # 數據增強 - 更激進版本
+        hsv_h=0.02,             # 略微增強顏色增強
+        hsv_s=0.8,             
+        hsv_v=0.5,             
+        degrees=12.0,           # 增強旋轉增強
+        translate=0.12,        
+        scale=0.6,              # 更大的縮放範圍
+        shear=2.5,             
+        fliplr=0.5,            
+        mosaic=1.0,            
+        mixup=0.05,             # 添加輕微mixup
         
         # 保存與評估
-        save_period=1,
+        save_period=2,          # 降低保存頻率以提高速度
         val=True,
-        name="gde_distill_01_layers",
+        name="gde_distill_aggressive",
         project="gde_pose_distill",
         exist_ok=True,
         
-       # 性能相關
-        amp=True,             # 混合精度訓練
+        # 性能相關
+        amp=True,              
         
         # 早停策略
-        patience=30,          # 20個epoch無改善則早停
+        patience=25,            # 調整早停耐心
         
         # 穩定性設置
-        seed=42,              # 固定隨機種子
-        deterministic=True,   # 確保結果可複現
+        seed=42,               
+        deterministic=True,    
     )
 
 if __name__ == "__main__":
