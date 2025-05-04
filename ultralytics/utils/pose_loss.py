@@ -160,7 +160,7 @@ class DistillationLoss(nn.Module):
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
         total_loss = torch.sum(torch.stack(distill_losses))
-        print(f"Total Distillation Loss: {total_loss:.4f} from {len(distill_losses)} layers")
+        # print(f"Total Distillation Loss: {total_loss:.4f} from {len(distill_losses)} layers")
         return total_loss
 
 
