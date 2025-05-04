@@ -45,6 +45,125 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+class DistillationLoss(nn.Module):
+    """Enhanced distillation loss class with multiple loss functions."""
+    
+    def __init__(self, device):
+        """Initialize distillation loss with multiple loss functions."""
+        super().__init__()
+        self.mse_loss = nn.MSELoss(reduction='mean')
+        self.device = device
+        
+        # 初始化層權重 - 早期層較低，後期層較高
+        self.layer_weights = {
+            0: 0.6,  # 第一層權重較低
+            1: 0.7,
+            3: 0.8,
+            5: 0.9,
+            7: 1.0   # 最後一層權重最高
+        }
+        
+        # 添加字符串形式的層權重對應
+        self.layer_name_weights = {
+            "model.0.conv": 0.6,  # 第一層權重較低
+            "model.1.conv": 0.7,
+            "model.3.conv": 0.8,
+            "model.5.conv": 0.9,
+            "model.7.conv": 1.0   # 最後一層權重最高
+        }
+    
+    def cosine_similarity_loss(self, s_feat, t_feat):
+        """Calculate cosine similarity loss between student and teacher features."""
+        # 展平特徵
+        s_feat_flat = s_feat.view(s_feat.size(0), -1)
+        t_feat_flat = t_feat.view(t_feat.size(0), -1)
+        
+        # 計算餘弦相似度
+        cos_sim = F.cosine_similarity(s_feat_flat, t_feat_flat, dim=1)
+        # 轉換為損失 (1 - 相似度)
+        return (1 - cos_sim).mean()
+    
+    def attention_loss(self, s_feat, t_feat):
+        """Calculate attention-based loss between student and teacher features."""
+        # 計算注意力圖 (特徵通道的L2範數)
+        s_attention = torch.norm(s_feat, p=2, dim=1)
+        t_attention = torch.norm(t_feat, p=2, dim=1)
+        
+        # L1損失
+        return F.l1_loss(s_attention, t_attention)
+        
+    def statistics_loss(self, s_feat, t_feat):
+        """Calculate statistics loss between student and teacher features."""
+        # 均值和方差統計
+        t_mean = t_feat.mean(dim=[0, 2, 3])
+        s_mean = s_feat.mean(dim=[0, 2, 3])
+        t_var = t_feat.var(dim=[0, 2, 3])
+        s_var = s_feat.var(dim=[0, 2, 3])
+        
+        # 均值和方差損失
+        mean_loss = F.mse_loss(s_mean, t_mean)
+        var_loss = F.mse_loss(s_var, t_var)
+        
+        return (mean_loss + var_loss) * 0.5
+    
+    def forward(self, teacher_features, student_features, target_layers, temp=1.0):
+        """Calculate combined distillation loss with multiple components."""
+        distill_losses = []
+        
+        for layer_idx in target_layers:
+            if layer_idx not in teacher_features or layer_idx not in student_features:
+                continue
+                
+            t_feat = teacher_features[layer_idx].detach()
+            s_feat = student_features[layer_idx]
+            
+            # 確保特徵形狀匹配
+            if t_feat.shape != s_feat.shape:
+                continue
+            
+            # 獲取層權重，優先使用字符串對應，其次使用數字索引對應，如果都沒有則使用默認值1.0
+            if isinstance(layer_idx, str) and layer_idx in self.layer_name_weights:
+                weight = self.layer_name_weights[layer_idx]
+            elif isinstance(layer_idx, int) and layer_idx in self.layer_weights:
+                weight = self.layer_weights[layer_idx]
+            else:
+                weight = 1.0
+            
+            # 1. MSE損失
+            mse_loss = self.mse_loss(s_feat, t_feat)
+            
+            # 2. 余弦相似度損失
+            cos_loss = self.cosine_similarity_loss(s_feat, t_feat)
+            
+            # 3. 注意力損失
+            att_loss = self.attention_loss(s_feat, t_feat)
+            
+            # 4. 統計損失
+            stat_loss = self.statistics_loss(s_feat, t_feat)
+            
+            # 組合損失，根據不同層的特性可調整權重
+            if (isinstance(layer_idx, int) and layer_idx <= 1) or (isinstance(layer_idx, str) and (layer_idx == "model.0.conv" or layer_idx == "model.1.conv")):
+                # 淺層更注重統計信息和注意力
+                combined_loss = (mse_loss * 0.4 + cos_loss * 0.2 + 
+                                att_loss * 0.2 + stat_loss * 0.2) * weight
+            else:
+                # 深層更注重MSE和余弦相似度
+                combined_loss = (mse_loss * 0.5 + cos_loss * 0.3 + 
+                                att_loss * 0.1 + stat_loss * 0.1) * weight
+            
+            # 打印每層的損失信息，便於調試
+            # print(f"Layer {layer_idx}, Weight: {weight:.2f}, MSE: {mse_loss:.4f}, COS: {cos_loss:.4f}, ATT: {att_loss:.4f}, STAT: {stat_loss:.4f}, Combined: {combined_loss:.4f}")
+            
+            distill_losses.append(combined_loss)
+        
+        if not distill_losses:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        total_loss = torch.sum(torch.stack(distill_losses))
+        print(f"Total Distillation Loss: {total_loss:.4f} from {len(distill_losses)} layers")
+        return total_loss
+
+
 class v8PoseLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 pose estimation."""
 
@@ -58,6 +177,9 @@ class v8PoseLoss(v8DetectionLoss):
         sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
         self.mse_loss = nn.MSELoss(reduction='mean')
+        
+        # 使用增强的蒸餾損失
+        self.distill_loss = DistillationLoss(self.device)
 
         self.model = model
 
@@ -171,25 +293,9 @@ class v8PoseLoss(v8DetectionLoss):
                 if not target_layers:
                     print(f"{log_prefix}教師和學生模型沒有共同的特徵層，無法計算蒸餾損失")
                     loss[5] = torch.tensor(0.0, device=self.device, requires_grad=True)
-                else:                    
-                    # Calculate distillation loss for each layer
-                    distill_losses = []
-                    for layer_idx in target_layers:
-                        t_feat = self.teacher_features[layer_idx].detach()  # Ensure we don't backprop through teacher
-                        s_feat = self.student_features[layer_idx]
-                        
-                        # Ensure feature shapes match
-                        if t_feat.shape != s_feat.shape:
-                            print(f"{log_prefix}層 {layer_idx} 的特徵形狀不匹配: 教師 {t_feat.shape} vs 學生 {s_feat.shape}")
-                            continue
-                        
-                        layer_loss = self.mse_loss(s_feat, t_feat)
-                        distill_losses.append(layer_loss)
-                    
-                    if distill_losses:
-                        loss[5] = torch.sum(torch.stack(distill_losses))
-                    else:
-                        loss[5] = torch.tensor(0.0, device=self.device, requires_grad=True)
+                else:
+                    # 使用增強的蒸餾損失
+                    loss[5] = self.distill_loss(self.teacher_features, self.student_features, target_layers)
             else:
                 # No features collected yet
                 print(f"{log_prefix}沒有收集到特徵，無法計算蒸餾損失")
