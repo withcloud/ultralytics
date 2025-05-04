@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore", message="divide by zero encountered in divide"
 
 def main():
     # Load a model
-    model = YOLO("models/gde-pose-640.pt")
+    model = YOLO("models/gde-pose-distill.pt")
 
     # Train the model
     results = model.train(
@@ -38,8 +38,8 @@ def main():
         
         # 蒸餾參數 - 更激進版本
         teacher="yolo11n-pose.pt",
-        target_layers=["model.0.conv", "model.1.conv", "model.2.cv1.conv", "model.2.cv2.conv", "model.3.conv", "model.4.cv1.conv", "model.4.cv2.conv", "model.5.conv", "model.6.cv1.conv", "model.6.cv2.conv", "model.7.conv"],
-        distill=0.9,            # 增加蒸餾權重
+        target_layers=["model.0.conv", "model.1.conv", "model.3.conv", "model.5.conv", "model.7.conv"],
+        distill=0.8,            # 增加蒸餾權重
         freezeAllBN=False,
 
         # 損失函數權重 - 更激進版本
