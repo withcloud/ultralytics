@@ -35,6 +35,8 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_Ghost,
+    C3k2_DFFM,
     C3x,
     CBFuse,
     CBLinear,
@@ -55,6 +57,7 @@ from ultralytics.nn.modules import (
     Index,
     LRPCHead,
     Pose,
+    GDEPose,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -76,9 +79,9 @@ from ultralytics.utils.loss import (
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
-    v8PoseLoss,
     v8SegmentationLoss,
 )
+from ultralytics.utils.pose_loss import v8PoseLoss
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (
@@ -297,6 +300,31 @@ class BaseModel(torch.nn.Module):
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
 
+        # Handle teacher if it exists in the batch
+        # The teacher model will now be loaded separately on each GPU
+        # and the forward pass will be done here
+        if "teacher" in batch and batch["teacher"] is not None:
+            teacher = batch["teacher"]
+            
+            # Ensure teacher is on the same device as the input images
+            current_device = batch["img"].device
+            
+            # Verify teacher device matches input device
+            teacher_device = next(teacher.parameters()).device
+            if teacher_device != current_device:
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                from ultralytics.utils import LOGGER
+                LOGGER.warning(f"[Rank {rank}] Teacher model on {teacher_device} but batch on {current_device}. Moving teacher to {current_device}")
+                
+                # Move teacher to current device if necessary
+                teacher = teacher.to(current_device)
+                batch["teacher"] = teacher
+            
+            with torch.no_grad():
+                teacher_preds = teacher(batch["img"])
+            batch["teacher_preds"] = teacher_preds
+
         preds = self.forward(batch["img"]) if preds is None else preds
         return self.criterion(preds, batch)
 
@@ -347,7 +375,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, GDEPose)) else self.forward(x)
 
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
@@ -1381,6 +1409,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2,
             C2f,
             C3k2,
+            C3k2_Ghost,
+            C3k2_DFFM,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1407,6 +1437,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2,
             C2f,
             C3k2,
+            C3k2_Ghost,
+            C3k2_DFFM,
             C2fAttn,
             C3,
             C3TR,
@@ -1448,6 +1480,14 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
+            if m is C3k2_Ghost:
+                legacy = False
+                if scale in "mlx":
+                    args[3] = True
+            if m is C3k2_DFFM:
+                legacy = False
+                if scale in "mlx":
+                    args[3] = True
             if m is A2C2f:
                 legacy = False
                 if scale in "lx":  # for L/X sizes
@@ -1469,12 +1509,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, GDEPose, ImagePoolingAttn, v10Detect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, GDEPose}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1565,7 +1605,7 @@ def guess_model_task(model):
             return "detect"
         if "segment" in m:
             return "segment"
-        if m == "pose":
+        if m == "pose" or "pose" in m:
             return "pose"
         if m == "obb":
             return "obb"

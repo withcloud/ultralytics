@@ -1,11 +1,15 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from copy import copy
+import os
 
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import PoseModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER
+from ultralytics.utils import DEFAULT_CFG, LOGGER, callbacks
 from ultralytics.utils.plotting import plot_images, plot_results
+import torch
+import torch.distributed as dist
+from ultralytics.nn.tasks import attempt_load_weights
 
 
 class PoseTrainer(yolo.detect.DetectionTrainer):
@@ -60,13 +64,440 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         if overrides is None:
             overrides = {}
         overrides["task"] = "pose"
+
+        self.teacher_path = overrides.get("teacher", None)  # Store the teacher path instead of model
+        self.teacher = None  # Initialized to None, will load the model later
+        self.distill = overrides.get("distill", 1.0)
+        self.freezeAllBN = overrides.get("freezeAllBN", False)
+        self.target_layers = overrides.get("target_layers", [])
+        
+        # For collecting features from layers
+        self.teacher_features = {}
+        self.student_features = {}
+        self.teacher_hooks = []
+        self.student_hooks = []
+
+        # Initialize parent class first to set up device and other attributes
         super().__init__(cfg, overrides, _callbacks)
+
+        # Now we can initialize the teacher model since self.device is available
+        if self.teacher_path is not None:
+            self.init_teacher_model()
+            
+            if _callbacks is None:
+                _callbacks = callbacks.get_default_callbacks()
+
+            _callbacks["on_train_start"].append(self.on_train_start)
+            _callbacks["on_train_epoch_start"].append(self.on_epoch_start)
+            _callbacks["on_train_epoch_end"].append(self.on_epoch_end)
+            _callbacks["on_val_start"].append(self.on_val_start)
+            _callbacks["on_val_end"].append(self.on_val_end)
+            _callbacks["on_train_end"].append(self.on_train_end)
+            _callbacks["teardown"].append(self.teardown)
+            _callbacks["on_batch_end"].append(self.on_batch_end)
 
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
                 "Apple MPS known Pose bug. Recommend 'device=cpu' for Pose models. "
                 "See https://github.com/ultralytics/ultralytics/issues/4031."
             )
+
+    def init_teacher_model(self):
+        """Initialize the teacher model on the current device."""
+        if self.teacher_path is not None and self.teacher is None:
+            # Get rank for distributed training
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            
+            # Log detailed information about which GPU is loading the teacher
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+            LOGGER.info(f"{log_prefix}Loading teacher model from {self.teacher_path}")
+            
+            # Load teacher model using attempt_load_weights to avoid circular imports
+            try:
+                if hasattr(torch.cuda, 'memory_allocated'):
+                    mem_before = torch.cuda.memory_allocated(self.device) / (1024 ** 2)  # MB
+                
+                # Explicitly set the device before loading the model
+                torch.cuda.set_device(self.device)
+                
+                # Load the model using attempt_load_weights - explicitly specify the device
+                self.teacher = attempt_load_weights(self.teacher_path, device=self.device)
+                
+                # Ensure the model is on the correct device
+                self.teacher = self.teacher.to(self.device)
+                
+                # Force all buffers and parameters to the correct device
+                for param in self.teacher.parameters():
+                    if param.device != self.device:
+                        LOGGER.warning(f"{log_prefix}Moving parameter from {param.device} to {self.device}")
+                        param.data = param.data.to(self.device)
+                
+                for buffer_name, buffer in self.teacher.named_buffers():
+                    if buffer.device != self.device:
+                        LOGGER.warning(f"{log_prefix}Moving buffer {buffer_name} from {buffer.device} to {self.device}")
+                        buffer.data = buffer.data.to(self.device)
+                
+                # Freeze teacher parameters
+                for k, v in self.teacher.named_parameters():
+                    v.requires_grad = False
+
+                # Set teacher model to eval mode
+                self.teacher.eval()
+
+                # Freeze BN layers
+                for m in self.teacher.modules():
+                    if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.BatchNorm1d)):
+                        m.eval()  # Only set BN layers to eval mode
+                        for param in m.parameters():
+                            param.requires_grad = False
+                
+                if hasattr(torch.cuda, 'memory_allocated'):
+                    mem_after = torch.cuda.memory_allocated(self.device) / (1024 ** 2)  # MB
+                    mem_used = mem_after - mem_before
+                    LOGGER.info(f"{log_prefix}Teacher model loaded successfully. Memory used: {mem_used:.2f} MB")
+                else:
+                    LOGGER.info(f"{log_prefix}Teacher model loaded successfully.")
+                
+                # Log teacher model structure details
+                teacher_params = sum(p.numel() for p in self.teacher.parameters())
+                LOGGER.info(f"{log_prefix}Teacher model has {teacher_params:,} parameters")
+                
+                # Log process ID for debugging
+                LOGGER.info(f"{log_prefix}Process ID: {os.getpid()}")
+                
+            except Exception as e:
+                LOGGER.error(f"{log_prefix}Error loading teacher model: {str(e)}")
+                raise
+            
+    def register_teacher_hooks(self):
+        """Register hooks on the teacher model to capture intermediate features."""
+        if self.teacher is not None:
+            # Clear any existing hooks
+            for hook in self.teacher_hooks:
+                hook.remove()
+            self.teacher_hooks = []
+            
+            # Get rank for distributed training
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+            log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+            
+            LOGGER.info(f"{log_prefix}Registering hooks for teacher model:")
+            
+            # 建立模塊名稱到模塊的映射
+            module_dict = {}
+            for name, module in self.teacher.named_modules():
+                module_dict[name] = module
+            
+            # 確保所有進程可以打印日誌
+            dist.barrier() if dist.is_initialized() else None
+            
+            # 收集所有可用的層
+            available_layers = {}
+            for name, module in self.teacher.named_modules():
+                if hasattr(module, 'forward'):
+                    available_layers[name] = type(module).__name__
+                    
+            if len(available_layers) <= 10:  # 只打印合理數量的層
+                LOGGER.info(f"{log_prefix}可用的教師模型層: {available_layers}")
+            else:
+                LOGGER.info(f"{log_prefix}教師模型層數量: {len(available_layers)}")
+                
+            # 處理每個目標層
+            success_layers = []
+            for target in self.target_layers:
+                if isinstance(target, int):
+                    # 如果是整數索引，直接獲取對應層
+                    try:
+                        layer = self.teacher.model[target]
+                        layer_full_name = f"model.{target}"
+                        layer_idx = target  # 用於hook的layer_idx
+                        success = True
+                    except (IndexError, AttributeError) as e:
+                        LOGGER.error(f"{log_prefix}無法訪問教師模型層 {target}: {e}")
+                        continue
+                else:
+                    # 如果是字符串路徑，從module_dict中查找
+                    if target in module_dict:
+                        layer = module_dict[target]
+                        layer_full_name = target
+                        # 對於字符串路徑，我們使用一個唯一標識作為layer_idx
+                        layer_idx = target
+                        success = True
+                    else:
+                        LOGGER.warning(f"{log_prefix}在教師模型中未找到指定層: {target}")
+                        # 嘗試查找相似的層名
+                        similar_layers = [name for name in module_dict.keys() if target in name]
+                        if similar_layers:
+                            LOGGER.info(f"{log_prefix}找到類似的層: {similar_layers[:5]}")
+                        continue
+                
+                # 獲取層的類型
+                layer_type = layer.__class__.__name__
+                
+                # 構建詳細的層信息
+                layer_info = f"層名稱: {layer_full_name}, 類型: {layer_type}"
+                
+                # 直接檢查該層是否有conv屬性
+                if hasattr(layer, 'conv'):
+                    layer_info += f", 通道數: {layer.conv.out_channels}"
+                
+                LOGGER.info(f"{log_prefix}{layer_info}")
+                
+                # 使用函數而不是lambda避免閉包問題
+                def get_hook_fn(idx):
+                    def hook_fn(module, input, output):
+                        self.teacher_features[idx] = output
+                    return hook_fn
+                
+                # 註冊勾子
+                hook = layer.register_forward_hook(get_hook_fn(layer_idx))
+                self.teacher_hooks.append(hook)
+                success_layers.append(layer_full_name)
+            
+            LOGGER.info(f"{log_prefix}教師模型勾子註冊完成，成功層數: {len(success_layers)}，層名: {success_layers}")
+            
+    def register_student_hooks(self):
+        """Register hooks on the student model to capture intermediate features."""
+        # Clear any existing hooks
+        for hook in self.student_hooks:
+            hook.remove()
+        self.student_hooks = []
+        
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Registering hooks for student model:")
+        
+        # 建立模塊名稱到模塊的映射
+        module_dict = {}
+        for name, module in self.model.named_modules():
+            module_dict[name] = module
+            
+        # 確保所有進程可以打印日誌
+        dist.barrier() if dist.is_initialized() else None
+        
+        # 收集所有可用的層
+        available_layers = {}
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'forward'):
+                available_layers[name] = type(module).__name__
+                
+        if len(available_layers) <= 10:  # 只打印合理數量的層
+            LOGGER.info(f"{log_prefix}可用的學生模型層: {available_layers}")
+        else:
+            LOGGER.info(f"{log_prefix}學生模型層數量: {len(available_layers)}")
+        
+        # 處理每個目標層
+        success_layers = []
+        for target in self.target_layers:
+            if isinstance(target, int):
+                # 如果是整數索引，直接獲取對應層
+                try:
+                    layer = self.model.model[target]
+                    layer_full_name = f"model.{target}"
+                    layer_idx = target  # 用於hook的layer_idx
+                    success = True
+                except (IndexError, AttributeError) as e:
+                    LOGGER.error(f"{log_prefix}無法訪問學生模型層 {target}: {e}")
+                    continue
+            else:
+                # 如果是字符串路徑，從module_dict中查找
+                if target in module_dict:
+                    layer = module_dict[target]
+                    layer_full_name = target
+                    # 對於字符串路徑，我們使用一個唯一標識作為layer_idx
+                    layer_idx = target
+                    success = True
+                else:
+                    LOGGER.warning(f"{log_prefix}在學生模型中未找到指定層: {target}")
+                    # 嘗試查找相似的層名
+                    similar_layers = [name for name in module_dict.keys() if target in name]
+                    if similar_layers:
+                        LOGGER.info(f"{log_prefix}找到類似的層: {similar_layers[:5]}")
+                    continue
+            
+            # 獲取層的類型
+            layer_type = layer.__class__.__name__
+            
+            # 構建詳細的層信息
+            layer_info = f"層名稱: {layer_full_name}, 類型: {layer_type}"
+            
+            # 直接檢查該層是否有conv屬性
+            if hasattr(layer, 'conv'):
+                layer_info += f", 通道數: {layer.conv.out_channels}"
+            
+            LOGGER.info(f"{log_prefix}{layer_info}")
+            
+            # 使用函數而不是lambda避免閉包問題
+            def get_hook_fn(idx):
+                def hook_fn(module, input, output):
+                    self.student_features[idx] = output
+                return hook_fn
+            
+            # 註冊勾子
+            hook = layer.register_forward_hook(get_hook_fn(layer_idx))
+            self.student_hooks.append(hook)
+            success_layers.append(layer_full_name)
+                
+        LOGGER.info(f"{log_prefix}學生模型勾子註冊完成，成功層數: {len(success_layers)}，層名: {success_layers}")
+        
+    def on_train_start(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        # 確保所有 GPU 都能輸出日誌
+        if dist.is_initialized():
+            # 確保進程按順序列印日誌
+            for r in range(dist.get_world_size()):
+                if r == rank:
+                    LOGGER.info(f"{log_prefix}Starting training on GPU {gpu_id}, PID {os.getpid()}")
+                dist.barrier()
+        else:
+            LOGGER.info(f"{log_prefix}Starting training...")
+        
+        if self.teacher is not None:
+            # 打印教師模型和學生模型的結構
+            LOGGER.info(f"{log_prefix}" + "=" * 80)
+            LOGGER.info(f"{log_prefix}教師模型結構:")
+            for name, module in self.teacher.named_modules():
+                if name.startswith("model.") and len(name.split(".")) <= 3:
+                    module_type = module.__class__.__name__
+                    num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+                    has_conv = hasattr(module, 'conv')
+                    channels_info = f", 通道數: {module.conv.out_channels}" if has_conv else ""
+                    LOGGER.info(f"{log_prefix}  - {name}: {module_type} (參數量: {num_params}){channels_info}")
+            
+            LOGGER.info(f"\n{log_prefix}學生模型結構:")
+            for name, module in self.model.named_modules():
+                if name.startswith("model.") and len(name.split(".")) <= 3:
+                    module_type = module.__class__.__name__
+                    num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+                    has_conv = hasattr(module, 'conv')
+                    channels_info = f", 通道數: {module.conv.out_channels}" if has_conv else ""
+                    LOGGER.info(f"{log_prefix}  - {name}: {module_type} (參數量: {num_params}){channels_info}")
+            LOGGER.info(f"{log_prefix}" + "=" * 80)
+
+            # 等待所有進程打印完日誌
+            if dist.is_initialized():
+                dist.barrier()
+                
+            # Register hooks for the teacher model
+            self.register_teacher_hooks()
+            
+            # 等待所有進程註冊完教師模型勾子
+            if dist.is_initialized():
+                dist.barrier()
+                
+            # Register hooks for the student model
+            self.register_student_hooks()
+            
+            # 等待所有進程註冊完學生模型勾子
+            if dist.is_initialized():
+                dist.barrier()
+
+    def on_epoch_start(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Starting epoch {trainer.epoch}/{trainer.epochs}")
+        
+        self.model.epoch = trainer.epoch
+        self.model.epochs = trainer.epochs
+        self.model.is_first_batch_in_epoch = True
+
+    def on_epoch_end(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Finished epoch {trainer.epoch}/{trainer.epochs}")
+
+    def on_val_start(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Starting validation...")
+
+    def on_val_end(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Validation completed")
+    
+    def on_train_end(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Training completed, cleaning up...")
+        
+        # Remove hooks when training ends
+        for hook in self.teacher_hooks:
+            hook.remove()
+        for hook in self.student_hooks:
+            hook.remove()
+
+        # Clear the stored features
+        self.teacher_features = {}
+        self.student_features = {}
+        
+        LOGGER.info(f"{log_prefix}Cleanup completed")
+    
+    def teardown(self, trainer):
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        LOGGER.info(f"{log_prefix}Teardown in progress...")
+        
+        # Make sure all hooks are removed
+        for hook in self.teacher_hooks:
+            hook.remove()
+        for hook in self.student_hooks:
+            hook.remove()
+            
+        LOGGER.info(f"{log_prefix}Teardown completed")
+    
+    def on_batch_end(self, trainer):
+        self.model.is_first_batch_in_epoch = False
+        pass
+
+    def set_target_layers(self, new_target_layers):
+        """
+        設置新的目標層並重新註冊勾子。
+        
+        Args:
+            new_target_layers (list): 包含層索引或層名稱的列表，例如 [0, 6, 13] 或 ["model.0.conv", "model.6.cv1"]
+        """
+        # Get rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        gpu_id = self.device.index if hasattr(self.device, 'index') else 0
+        log_prefix = f"[Rank {rank}, GPU {gpu_id}] "
+        
+        # 更新目標層
+        self.target_layers = new_target_layers
+        LOGGER.info(f"{log_prefix}更新目標層為: {self.target_layers}")
+        
+        # 重新註冊勾子
+        self.register_teacher_hooks()
+        self.register_student_hooks()
+        
+        return self.target_layers
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """
@@ -95,7 +526,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Returns an instance of the PoseValidator class for validation."""
-        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
+        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss", "d_loss"
         return yolo.pose.PoseValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
