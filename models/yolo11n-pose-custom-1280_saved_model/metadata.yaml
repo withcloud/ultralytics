@@ -1,0 +1,23 @@
+description: Ultralytics YOLO11n-pose model trained on /root/autodl-tmp/withcloud/ultralytics/ultralytics/cfg/datasets/coco-pose.yaml
+author: Ultralytics
+date: '2025-05-05T00:11:46.853364'
+version: 8.3.113
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: pose
+batch: 1
+imgsz:
+- 1280
+- 1280
+names:
+  0: person
+args:
+  batch: 1
+  half: false
+  int8: false
+  nms: false
+channels: 3
+kpt_shape:
+- 17
+- 3

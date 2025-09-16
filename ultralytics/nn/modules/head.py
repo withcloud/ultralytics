@@ -289,6 +289,84 @@ class Pose(Detect):
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
 
+class ECAAttention(nn.Module):
+    """高效通道注意力機制 (Efficient Channel Attention)
+    論文參考: ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks
+    https://arxiv.org/abs/1910.03151
+    """
+    def __init__(self, c, k_size=3):
+        super().__init__()
+        # 全局平均池化
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # 使用標準的1D卷積操作
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=k_size, 
+            padding=(k_size-1)//2, 
+            bias=False
+        )
+        
+        # 初始化卷積權重，使其更穩定
+        nn.init.ones_(self.conv.weight)
+        
+    def forward(self, x):
+        # 確保輸入是連續的內存佈局
+        x = x.contiguous()
+        b, c, _, _ = x.shape
+        
+        # 全局平均池化
+        y = self.avg_pool(x)  # [b, c, 1, 1]
+        
+        # 重塑以適應1D卷積 (避免過多的維度變換)
+        y = y.view(b, 1, c)  # [b, 1, c]
+        
+        # 應用1D卷積
+        y = self.conv(y)  # [b, 1, c]
+        
+        # sigmoid激活並正確地廣播
+        y = torch.sigmoid(y).view(b, c, 1, 1)
+        
+        # 使用乘法應用注意力
+        return x * y
+
+class GDEPose(Pose):
+    """高效GDE-Pose檢測頭"""
+    def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
+        super().__init__(nc, kpt_shape, ch)
+        # 僅在最大特徵圖應用ECA
+        self.eca = nn.ModuleList()
+        for i, x in enumerate(ch):
+            if i == len(ch) - 1:  # 僅應用在最後/最大特徵圖
+                self.eca.append(ECAAttention(x))
+            else:
+                self.eca.append(nn.Identity())
+        
+    def forward(self, x):
+        bs = x[0].shape[0]  # 批次大小
+        
+        # 創建新的特徵列表，避免修改原始輸入
+        x_processed = []
+        for i in range(self.nl):
+            # 應用注意力機制並確保連續內存佈局
+            x_processed.append(self.eca[i](x[i]))
+            
+        # 處理關鍵點預測
+        kpt = torch.cat([self.cv4[i](x_processed[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)
+        
+        # 使用處理後的特徵進行目標檢測
+        detect_out = Detect.forward(self, x_processed)
+        
+        if self.training:
+            return detect_out, kpt
+            
+        # 解碼關鍵點坐標
+        pred_kpt = self.kpts_decode(bs, kpt)
+        
+        # 輸出格式取決於是否處於導出模式
+        if self.export:
+            return torch.cat([detect_out, pred_kpt], 1)
+        else:
+            return torch.cat([detect_out[0], pred_kpt], 1), (detect_out[1], kpt)
 
 class Classify(nn.Module):
     """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)."""

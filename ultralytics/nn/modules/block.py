@@ -41,6 +41,8 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "C3k2",
+    "C3k2_Ghost",
+    "C3k2_DFFM",
     "C2fPSA",
     "C2PSA",
     "RepVGGDW",
@@ -1095,6 +1097,156 @@ class C3k2(C2f):
             C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
         )
 
+class C3k2_Ghost(C3k2):
+    """基於Ghost Bottleneck的C3k2模塊"""
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        super().__init__(c1, c2, n, c3k, e, g, shortcut)
+        self.m = nn.ModuleList(
+            GhostBottleneck(self.c, self.c) for _ in range(n)
+        )
+        
+    def forward(self, x):
+        # 確保輸入的張量是連續的
+        x = x.contiguous()
+        
+        # 分割特徵並確保每個部分是連續的
+        y = list(self.cv1(x).chunk(2, 1))
+        y[0] = y[0].contiguous()
+        y[1] = y[1].contiguous()
+        
+        # 處理特徵並確保結果是連續的
+        y_processed = []
+        for m in self.m:
+            processed = m(y[-1]).contiguous()
+            y_processed.append(processed)
+            
+        # 添加處理後的特徵並確保所有張量是連續的
+        y.extend(y_processed)
+        for i in range(len(y)):
+            if not y[i].is_contiguous():
+                y[i] = y[i].contiguous()
+                
+        # 連接特徵並返回結果
+        return self.cv2(torch.cat(y, 1))
+
+# 动态感受野模块
+class DynamicReceptiveFieldModule(nn.Module):
+    """動態感受野模塊"""
+    def __init__(self, c):
+        super().__init__()
+        self.conv1x1 = Conv(c, c, 1, 1)
+        self.conv3x3 = Conv(c, c, 3, 1, 1)
+        # 自適應權重參數
+        self.weight = nn.Parameter(torch.ones(2))
+        
+    def forward(self, x):
+        # 確保輸入是連續的
+        x = x.contiguous()
+        
+        # 計算軟最大權重
+        weights = F.softmax(self.weight, dim=0)
+        
+        # 應用卷積並確保結果是連續的
+        x1 = self.conv1x1(x).contiguous()
+        x3 = self.conv3x3(x).contiguous()
+        
+        # 加權融合並確保結果是連續的
+        return (weights[0] * x1 + weights[1] * x3).contiguous()
+
+# 多尺度特征融合模块
+class MultiScaleFeatureFusion(nn.Module):
+    """多尺度特徵融合模塊"""
+    def __init__(self, c):
+        super().__init__()
+        self.horizontal_fusion = Conv(c, c, 3, 1, 1)
+        self.vertical_fusion = Conv(c, c, 3, 1, 1)
+        
+    def forward(self, x):
+        # 確保輸入是連續的
+        x = x.contiguous()
+        
+        # 應用水平和垂直融合，並確保結果是連續的
+        h = self.horizontal_fusion(x).contiguous()
+        v = self.vertical_fusion(x).contiguous()
+        
+        # 確保輸出是連續的
+        return (h + v).contiguous()
+
+# 轻量级通道压缩模块
+class LightweightChannelCompression(nn.Module):
+    """輕量級通道壓縮模塊"""
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.conv = Conv(c_in, c_out, 1, 1)
+        
+    def forward(self, x):
+        # 確保輸入是連續的
+        x = x.contiguous()
+        # 確保輸出也是連續的
+        return self.conv(x).contiguous()
+
+# 完整的DFFM模块
+class DFFM(nn.Module):
+    """動態特徵融合模塊"""
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.drf = DynamicReceptiveFieldModule(c1)
+        self.msf = MultiScaleFeatureFusion(c1)
+        self.lcc = LightweightChannelCompression(c1, c2)
+        
+    def forward(self, x):
+        # 確保輸入是連續的
+        x = x.contiguous()
+        # 應用各個組件並確保中間結果是連續的
+        x = self.drf(x).contiguous()
+        x = self.msf(x).contiguous()
+        return self.lcc(x).contiguous()
+
+class C3k2_DFFM(nn.Module):
+    """輕量級動態特徵融合的C3k2模塊"""
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        super().__init__()
+        self.c = int(c2 * e)  # 隱藏通道
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(3 * self.c, c2, 1)  # 保持與原始C3k2相同的通道數（關鍵修改點）
+        
+        # 使用原始Bottleneck或GhostBottleneck
+        self.m = nn.ModuleList(GhostBottleneck(self.c, self.c) for _ in range(n))
+        
+        # 極簡化的DFFM實現
+        self.dffm_weight = nn.Parameter(torch.ones(2))
+        self.dffm_conv = DWConv(self.c, self.c, 3)  # 使用深度可分離卷積替代標準卷積
+        
+    def forward(self, x):
+        # 確保輸入的連續性
+        x = x.contiguous()
+        
+        # 分割特徵並確保每個部分都是連續的
+        y = list(self.cv1(x).chunk(2, 1))
+        y[0] = y[0].contiguous()
+        y[1] = y[1].contiguous()
+        
+        # 處理每個模塊並確保結果的連續性
+        y_processed = []
+        for m in self.m:
+            processed = m(y[-1]).contiguous()
+            y_processed.append(processed)
+        
+        # 輕量級特徵融合
+        last_feat = y_processed[-1]
+        weights = F.softmax(self.dffm_weight, dim=0)
+        dffm_out = (weights[0] * last_feat + weights[1] * self.dffm_conv(last_feat)).contiguous()
+        
+        # 替換最後處理的特徵，確保連續性
+        y_processed[-1] = dffm_out
+        y.extend(y_processed)
+        
+        # 確保連接前所有張量都是連續的
+        for i in range(len(y)):
+            if not y[i].is_contiguous():
+                y[i] = y[i].contiguous()
+                
+        return self.cv2(torch.cat(y, 1))
 
 class C3k(C3):
     """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
